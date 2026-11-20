@@ -71,3 +71,11 @@ asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 addopts = "-ra"
 filterwarnings = ["error::DeprecationWarning:app.*"]
+
+[tool.coverage.run]
+source = ["app"]
+concurrency = ["greenlet", "thread"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "pragma: no cover"]
