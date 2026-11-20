@@ -26,10 +26,10 @@ from app.core.errors import (
 )
 from app.core.rbac import Permission, has_permission
 from app.core.security import hash_opaque_token, new_opaque_token, utcnow
-from app.models import AccessLevel, FilePermission, ShareLink, StoredFile, User
+from app.models import AccessLevel, FilePermission, ShareLink, StoredFile, UploadIntent, User
 from app.services.audit import AuditAction, AuditLog, Outcome
 from app.services.auth import normalize_email
-from app.services.storage import ObjectStorage
+from app.services.storage import ObjectStorage, PresignedPost
 
 log = structlog.get_logger(__name__)
 
@@ -59,6 +59,12 @@ def sanitize_content_type(value: str | None) -> str:
 class FileWithAccess:
     file: StoredFile
     access: AccessLevel
+
+
+@dataclass(frozen=True, slots=True)
+class DirectUpload:
+    intent: UploadIntent
+    post: PresignedPost
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +168,118 @@ class FileService:
             raise
         log.info("file_uploaded", file_id=str(file_id), owner_id=str(owner.id), size=size)
         return record
+
+    # --- direct-to-S3 uploads -----------------------------------------------------------
+    async def start_direct_upload(
+        self,
+        owner: User,
+        *,
+        filename: str,
+        content_type: str | None,
+        size_bytes: int,
+        sha256: str | None,
+    ) -> DirectUpload:
+        """Reserve a key and hand back a presigned POST pinned to its size and type."""
+        if not has_permission(owner.role, Permission.FILES_UPLOAD):
+            raise PermissionDenied("Your role cannot upload files")
+        if size_bytes > self.settings.direct_upload_max_bytes:
+            raise PayloadTooLarge(
+                f"File exceeds the {self.settings.direct_upload_max_bytes} byte limit"
+            )
+        upload_id = uuid.uuid4()
+        ttl = self.settings.upload_intent_ttl_seconds
+        intent = UploadIntent(
+            id=upload_id,
+            owner_id=owner.id,
+            storage_key=f"files/{owner.id}/{upload_id}",
+            filename=sanitize_filename(filename),
+            content_type=sanitize_content_type(content_type),
+            size_bytes=size_bytes,
+            sha256=sha256.lower() if sha256 else None,
+            expires_at=utcnow() + timedelta(seconds=ttl),
+        )
+        post = self.storage.presigned_upload(
+            intent.storage_key,
+            content_type=intent.content_type,
+            size_bytes=size_bytes,
+            sha256=intent.sha256,
+            ttl_seconds=ttl,
+        )
+        self.session.add(intent)
+        await self.session.commit()
+        return DirectUpload(intent, post)
+
+    async def complete_direct_upload(self, owner: User, upload_id: uuid.UUID) -> StoredFile:
+        """Verify what actually landed in S3, then turn the intent into a file.
+
+        Nothing the client did is trusted: size, content type and checksum are re-checked
+        against the object itself, and a mismatching object is deleted.
+        """
+        intent = await self.session.scalar(
+            select(UploadIntent)
+            .where(UploadIntent.id == upload_id, UploadIntent.owner_id == owner.id)
+            .with_for_update()
+        )
+        if intent is None:
+            raise NotFound("Upload not found")
+        key = intent.storage_key
+        # The policy expires with the intent, so an object can only arrive before then;
+        # allow completing a little later so a slow last request can still be confirmed.
+        if intent.expires_at + timedelta(minutes=5) < utcnow():
+            await self._discard_intent(intent, owner, "expired")
+            raise Gone("This upload has expired; start a new one")
+        info = await self.storage.head(key)
+        if info is None:
+            await self.session.rollback()
+            raise ValidationFailed("No object has been uploaded yet")
+        if info.size_bytes != intent.size_bytes:
+            await self._discard_intent(intent, owner, "size_mismatch")
+            raise ValidationFailed("Uploaded object does not match the declared size")
+        if (info.content_type or "").split(";", 1)[0].strip().lower() != intent.content_type:
+            await self._discard_intent(intent, owner, "content_type_mismatch")
+            raise ValidationFailed("Uploaded object does not match the declared content type")
+        digest = info.sha256 or await self.storage.sha256(key)
+        if intent.sha256 and digest != intent.sha256:
+            await self._discard_intent(intent, owner, "checksum_mismatch")
+            raise ValidationFailed("Uploaded object does not match the declared SHA-256")
+
+        record = StoredFile(
+            id=intent.id,
+            owner_id=owner.id,
+            filename=intent.filename,
+            content_type=intent.content_type,
+            size_bytes=info.size_bytes,
+            sha256=digest,
+            storage_key=key,
+        )
+        await self.session.delete(intent)
+        self.session.add(record)
+        self.audit.record(
+            AuditAction.FILE_UPLOADED,
+            actor_id=owner.id,
+            target_type="file",
+            target_id=record.id,
+            size_bytes=record.size_bytes,
+            sha256=digest,
+            method="direct",
+        )
+        await self.session.commit()
+        log.info("file_uploaded", file_id=str(record.id), owner_id=str(owner.id), direct=True)
+        return record
+
+    async def _discard_intent(self, intent: UploadIntent, owner: User, reason: str) -> None:
+        key, upload_id = intent.storage_key, intent.id
+        await self.session.delete(intent)
+        self.audit.record(
+            AuditAction.FILE_UPLOAD_REJECTED,
+            outcome=Outcome.FAILURE,
+            actor_id=owner.id,
+            target_type="upload",
+            target_id=upload_id,
+            reason=reason,
+        )
+        await self.session.commit()
+        await self.storage.delete(key)
 
     async def list_for(self, user: User, scope: str) -> list[FileWithAccess]:
         results: list[FileWithAccess] = []

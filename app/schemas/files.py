@@ -21,6 +21,22 @@ class FileOut(BaseModel):
     access: AccessLevel
 
 
+class DirectUploadRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=1024)
+    content_type: str | None = Field(default=None, max_length=255)
+    size_bytes: int = Field(ge=1)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{64}$")
+
+
+class DirectUploadOut(BaseModel):
+    upload_id: uuid.UUID
+    # POST ``fields`` plus the file (as the last form field, named "file") to ``url``.
+    url: str
+    fields: dict[str, str]
+    expires_at: datetime
+    complete_url: str
+
+
 class FileRename(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
 

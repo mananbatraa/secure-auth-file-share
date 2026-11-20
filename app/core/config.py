@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     s3_secret_access_key: SecretStr | None = None
     s3_create_bucket: bool = False
     max_upload_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    # Direct-to-S3 uploads bypass the API, so they can be much larger.
+    direct_upload_max_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=1)
+    upload_intent_ttl_seconds: int = Field(default=900, ge=60)
     download_url_default_ttl_seconds: int = Field(default=300, ge=10)
     download_url_max_ttl_seconds: int = Field(default=3600, ge=10)
     share_link_redirect_ttl_seconds: int = Field(default=60, ge=10)

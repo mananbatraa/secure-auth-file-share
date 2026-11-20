@@ -9,6 +9,8 @@ from fastapi.responses import RedirectResponse, Response
 from app.api.deps import ClientDep, CurrentUser, FileServiceDep, ResourcesDep
 from app.models import AccessLevel, ShareLink
 from app.schemas.files import (
+    DirectUploadOut,
+    DirectUploadRequest,
     DownloadUrl,
     FileOut,
     FileRename,
@@ -41,6 +43,42 @@ async def upload_file(upload: UploadFile, user: CurrentUser, files: FileServiceD
     record = await files.upload(
         user, upload.file, filename=upload.filename, content_type=upload.content_type
     )
+    return _file_out(FileWithAccess(record, AccessLevel.OWNER))
+
+
+@router.post("/uploads", response_model=DirectUploadOut, status_code=status.HTTP_201_CREATED)
+async def start_direct_upload(
+    body: DirectUploadRequest, request: Request, user: CurrentUser, files: FileServiceDep
+) -> DirectUploadOut:
+    """Get a presigned POST so the client uploads straight to S3, bypassing the API."""
+    started = await files.start_direct_upload(
+        user,
+        filename=body.filename,
+        content_type=body.content_type,
+        size_bytes=body.size_bytes,
+        sha256=body.sha256,
+    )
+    return DirectUploadOut(
+        upload_id=started.intent.id,
+        url=started.post.url,
+        fields=started.post.fields,
+        expires_at=started.intent.expires_at,
+        complete_url=str(
+            request.url_for("complete_direct_upload", upload_id=str(started.intent.id))
+        ),
+    )
+
+
+@router.post(
+    "/uploads/{upload_id}/complete",
+    name="complete_direct_upload",
+    response_model=FileOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def complete_direct_upload(
+    upload_id: uuid.UUID, user: CurrentUser, files: FileServiceDep
+) -> FileOut:
+    record = await files.complete_direct_upload(user, upload_id)
     return _file_out(FileWithAccess(record, AccessLevel.OWNER))
 
 

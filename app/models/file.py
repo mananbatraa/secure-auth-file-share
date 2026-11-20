@@ -74,3 +74,22 @@ class ShareLink(TimestampMixin, Base):
     max_downloads: Mapped[int | None] = mapped_column(Integer)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class UploadIntent(TimestampMixin, Base):
+    """A pending direct-to-S3 upload: the client POSTs to S3, then confirms with the API."""
+
+    __tablename__ = "upload_intents"
+
+    # Becomes the file's id on completion.
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    storage_key: Mapped[str] = mapped_column(String(512), unique=True)
+    filename: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(255))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    # Client-declared SHA-256 (hex); verified before the file is accepted.
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

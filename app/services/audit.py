@@ -30,6 +30,7 @@ class AuditAction(StrEnum):
     PASSWORD_CHANGED = "auth.password_changed"  # noqa: S105 - an event name
     USER_UPDATED = "admin.user_updated"
     FILE_UPLOADED = "file.uploaded"
+    FILE_UPLOAD_REJECTED = "file.upload_rejected"
     FILE_RENAMED = "file.renamed"
     FILE_DELETED = "file.deleted"
     FILE_DOWNLOAD_URL = "file.download_url_issued"
