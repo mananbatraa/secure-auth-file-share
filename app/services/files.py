@@ -27,6 +27,7 @@ from app.core.errors import (
 from app.core.rbac import Permission, has_permission
 from app.core.security import hash_opaque_token, new_opaque_token, utcnow
 from app.models import AccessLevel, FilePermission, ShareLink, StoredFile, User
+from app.services.audit import AuditAction, AuditLog, Outcome
 from app.services.auth import normalize_email
 from app.services.storage import ObjectStorage
 
@@ -67,10 +68,17 @@ class GrantWithEmail:
 
 
 class FileService:
-    def __init__(self, session: AsyncSession, storage: ObjectStorage, settings: Settings) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        storage: ObjectStorage,
+        settings: Settings,
+        audit: AuditLog | None = None,
+    ) -> None:
         self.session = session
         self.storage = storage
         self.settings = settings
+        self.audit = audit or AuditLog(session)
 
     # --- access control -----------------------------------------------------------------
     async def access_level(self, user: User, file: StoredFile) -> AccessLevel | None:
@@ -138,6 +146,14 @@ class FileService:
             storage_key=key,
         )
         self.session.add(record)
+        self.audit.record(
+            AuditAction.FILE_UPLOADED,
+            actor_id=owner.id,
+            target_type="file",
+            target_id=file_id,
+            size_bytes=size,
+            sha256=record.sha256,
+        )
         try:
             await self.session.commit()
         except Exception:
@@ -171,7 +187,15 @@ class FileService:
 
     async def rename(self, user: User, file_id: uuid.UUID, filename: str) -> FileWithAccess:
         fa = await self.get_for(user, file_id, AccessLevel.EDITOR)
-        fa.file.filename = sanitize_filename(filename)
+        old, fa.file.filename = fa.file.filename, sanitize_filename(filename)
+        self.audit.record(
+            AuditAction.FILE_RENAMED,
+            actor_id=user.id,
+            target_type="file",
+            target_id=file_id,
+            old=old,
+            new=fa.file.filename,
+        )
         await self.session.commit()
         return fa
 
@@ -179,6 +203,13 @@ class FileService:
         fa = await self.get_for(user, file_id, AccessLevel.OWNER)
         key = fa.file.storage_key
         await self.session.delete(fa.file)
+        self.audit.record(
+            AuditAction.FILE_DELETED,
+            actor_id=user.id,
+            target_type="file",
+            target_id=file_id,
+            owner_id=str(fa.file.owner_id),
+        )
         await self.session.commit()
         await self.storage.delete(key)
         log.info("file_deleted", file_id=str(file_id), by=str(user.id))
@@ -195,6 +226,15 @@ class FileService:
         url = self.storage.presigned_download_url(
             fa.file.storage_key, filename=fa.file.filename, ttl_seconds=ttl
         )
+        self.audit.record(
+            AuditAction.FILE_DOWNLOAD_URL,
+            actor_id=user.id,
+            target_type="file",
+            target_id=file_id,
+            access=fa.access.value,
+            ttl_seconds=ttl,
+        )
+        await self.session.commit()
         return url, utcnow() + timedelta(seconds=ttl)
 
     # --- per-user grants ----------------------------------------------------------------
@@ -233,6 +273,15 @@ class FileService:
         grant.level = level
         grant.expires_at = expires_at
         grant.granted_by_id = owner.id
+        self.audit.record(
+            AuditAction.GRANT_CREATED,
+            actor_id=owner.id,
+            target_type="file",
+            target_id=file_id,
+            grantee_id=str(grantee.id),
+            level=level.value,
+            expires_at=expires_at.isoformat() if expires_at else None,
+        )
         await self.session.commit()
         await self.session.refresh(grant)
         return GrantWithEmail(grant, grantee.email)
@@ -257,6 +306,13 @@ class FileService:
         if grant is None:
             raise NotFound("No such grant")
         await self.session.delete(grant)
+        self.audit.record(
+            AuditAction.GRANT_REVOKED,
+            actor_id=owner.id,
+            target_type="file",
+            target_id=file_id,
+            grantee_id=str(user_id),
+        )
         await self.session.commit()
 
     # --- anonymous share links ----------------------------------------------------------
@@ -277,6 +333,7 @@ class FileService:
             )
         token = new_opaque_token()
         link = ShareLink(
+            id=uuid.uuid4(),
             file_id=file_id,
             created_by_id=owner.id,
             token_hash=hash_opaque_token(token),
@@ -285,6 +342,15 @@ class FileService:
             download_count=0,
         )
         self.session.add(link)
+        self.audit.record(
+            AuditAction.LINK_CREATED,
+            actor_id=owner.id,
+            target_type="share_link",
+            target_id=link.id,
+            file_id=str(file_id),
+            expires_in_seconds=expires_in_seconds,
+            max_downloads=max_downloads,
+        )
         await self.session.commit()
         await self.session.refresh(link)
         return link, token
@@ -303,6 +369,13 @@ class FileService:
             raise NotFound("No such share link")
         if link.revoked_at is None:
             link.revoked_at = utcnow()
+            self.audit.record(
+                AuditAction.LINK_REVOKED,
+                actor_id=owner.id,
+                target_type="share_link",
+                target_id=link_id,
+                file_id=str(file_id),
+            )
             await self.session.commit()
 
     async def redeem_link(self, token: str) -> str:
@@ -328,10 +401,17 @@ class FileService:
         )
         if link_id is None:
             await self.session.rollback()
-            exists = await self.session.scalar(
+            existing = await self.session.scalar(
                 select(ShareLink.id).where(ShareLink.token_hash == hash_opaque_token(token))
             )
-            if exists is None:
+            await self.audit.record_now(
+                AuditAction.LINK_REJECTED,
+                outcome=Outcome.FAILURE,
+                target_type="share_link" if existing else None,
+                target_id=existing,
+                reason="unknown_token" if existing is None else "expired_revoked_or_exhausted",
+            )
+            if existing is None:
                 raise NotFound("Share link not found")
             raise Gone("This share link has expired, been revoked, or reached its download limit")
         file = await self.session.scalar(
@@ -339,6 +419,13 @@ class FileService:
             .join(ShareLink, ShareLink.file_id == StoredFile.id)
             .where(ShareLink.id == link_id)
         )
+        if file is not None:
+            self.audit.record(
+                AuditAction.LINK_REDEEMED,
+                target_type="share_link",
+                target_id=link_id,
+                file_id=str(file.id),
+            )
         await self.session.commit()
         if file is None:  # pragma: no cover - FK cascade makes this unreachable
             raise NotFound("Share link not found")

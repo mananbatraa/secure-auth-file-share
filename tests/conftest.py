@@ -41,7 +41,7 @@ TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/fileshare_test"
 )
 PASSWORD = "correct-horse-battery-staple"
-TABLES = "share_links, file_permissions, files, refresh_tokens, oauth_accounts, users"
+TABLES = "audit_events, share_links, file_permissions, files, refresh_tokens, oauth_accounts, users"
 
 
 def _free_port() -> int:

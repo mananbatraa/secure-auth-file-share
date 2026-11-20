@@ -13,6 +13,7 @@ from app.core.rbac import Permission, has_permission
 from app.core.security import decode_access_token
 from app.models import User
 from app.resources import Resources
+from app.services.audit import AuditLog
 from app.services.auth import AuthService, ClientInfo
 from app.services.files import FileService
 from app.services.oauth import OAuthService
@@ -55,15 +56,24 @@ def client_info(request: Request, settings: SettingsDep) -> ClientInfo:
 ClientDep = Annotated[ClientInfo, Depends(client_info)]
 
 
-def get_auth_service(session: SessionDep, settings: SettingsDep) -> AuthService:
-    return AuthService(session, settings)
+def get_audit_log(session: SessionDep, client: ClientDep) -> AuditLog:
+    return AuditLog(session, ip_address=client.ip_address, user_agent=client.user_agent)
+
+
+AuditLogDep = Annotated[AuditLog, Depends(get_audit_log)]
+
+
+def get_auth_service(session: SessionDep, settings: SettingsDep, audit: AuditLogDep) -> AuthService:
+    return AuthService(session, settings, audit)
 
 
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 
 
-def get_file_service(session: SessionDep, resources: ResourcesDep) -> FileService:
-    return FileService(session, resources.storage, resources.settings)
+def get_file_service(
+    session: SessionDep, resources: ResourcesDep, audit: AuditLogDep
+) -> FileService:
+    return FileService(session, resources.storage, resources.settings, audit)
 
 
 FileServiceDep = Annotated[FileService, Depends(get_file_service)]

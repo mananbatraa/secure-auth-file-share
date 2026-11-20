@@ -30,6 +30,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models import RefreshToken, User
+from app.services.audit import AuditAction, AuditLog, Outcome
 
 log = structlog.get_logger(__name__)
 
@@ -64,16 +65,24 @@ def validate_password(settings: Settings, password: str, *, email: str | None = 
 
 
 class AuthService:
-    def __init__(self, session: AsyncSession, settings: Settings) -> None:
+    def __init__(
+        self, session: AsyncSession, settings: Settings, audit: AuditLog | None = None
+    ) -> None:
         self.session = session
         self.settings = settings
+        self.audit = audit or AuditLog(session)
 
     # --- accounts -----------------------------------------------------------------------
     async def register(self, email: str, password: str, *, role: Role = Role.MEMBER) -> User:
         email = normalize_email(email)
         validate_password(self.settings, password, email=email)
-        user = User(email=email, hashed_password=hash_password(password), role=role)
+        user = User(
+            id=uuid.uuid4(), email=email, hashed_password=hash_password(password), role=role
+        )
         self.session.add(user)
+        self.audit.record(
+            AuditAction.REGISTER, actor_id=user.id, target_type="user", target_id=user.id
+        )
         try:
             await self.session.commit()
         except IntegrityError as exc:
@@ -89,17 +98,44 @@ class AuthService:
         user = await self.get_user_by_email(email)
         if user is None:
             burn_password_check(password)
+            await self._login_failed(email, None, "unknown_email")
             raise InvalidCredentials()
-        if not verify_password(password, user.hashed_password) or not user.is_active:
+        if not verify_password(password, user.hashed_password):
+            await self._login_failed(email, user.id, "bad_password")
+            raise InvalidCredentials()
+        if not user.is_active:
+            await self._login_failed(email, user.id, "inactive")
             raise InvalidCredentials()
         return user
 
+    async def _login_failed(self, email: str, user_id: uuid.UUID | None, reason: str) -> None:
+        await self.audit.record_now(
+            AuditAction.LOGIN,
+            outcome=Outcome.FAILURE,
+            actor_id=user_id,
+            target_type="user",
+            target_id=user_id,
+            email=normalize_email(email),
+            reason=reason,
+        )
+
     async def change_password(self, user: User, current: str, new: str) -> None:
         if not verify_password(current, user.hashed_password):
+            await self.audit.record_now(
+                AuditAction.PASSWORD_CHANGED,
+                outcome=Outcome.FAILURE,
+                actor_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                reason="bad_password",
+            )
             raise InvalidCredentials()
         validate_password(self.settings, new, email=user.email)
         user.hashed_password = hash_password(new)
-        await self.revoke_all_sessions(user, commit=False)
+        await self.revoke_all_sessions(user, commit=False, audit=False)
+        self.audit.record(
+            AuditAction.PASSWORD_CHANGED, actor_id=user.id, target_type="user", target_id=user.id
+        )
         await self.session.commit()
 
     # --- tokens -------------------------------------------------------------------------
@@ -137,6 +173,9 @@ class AuthService:
 
     async def login(self, email: str, password: str, client: ClientInfo) -> IssuedTokens:
         user = await self.authenticate(email, password)
+        self.audit.record(
+            AuditAction.LOGIN, actor_id=user.id, target_type="user", target_id=user.id
+        )
         tokens, _ = await self.issue_tokens(user, client)
         log.info("login_succeeded", user_id=str(user.id))
         return tokens
@@ -158,6 +197,13 @@ class AuthService:
             raise InvalidToken()
         if row.used_at is not None or row.revoked_at is not None:
             await self._revoke_family(row.family_id)
+            self.audit.record(
+                AuditAction.REFRESH_REUSE,
+                outcome=Outcome.FAILURE,
+                actor_id=row.user_id,
+                target_type="token_family",
+                target_id=row.family_id,
+            )
             await self.session.commit()
             log.warning(
                 "refresh_token_reuse_detected",
@@ -191,9 +237,17 @@ class AuthService:
         )
         if row is not None:
             await self._revoke_family(row.family_id)
+            self.audit.record(
+                AuditAction.LOGOUT,
+                actor_id=row.user_id,
+                target_type="token_family",
+                target_id=row.family_id,
+            )
             await self.session.commit()
 
-    async def revoke_all_sessions(self, user: User, *, commit: bool = True) -> None:
+    async def revoke_all_sessions(
+        self, user: User, *, commit: bool = True, audit: bool = True
+    ) -> None:
         """Revoke every refresh token and invalidate outstanding access tokens."""
         await self.session.execute(
             update(RefreshToken)
@@ -201,6 +255,10 @@ class AuthService:
             .values(revoked_at=utcnow())
         )
         user.token_version += 1
+        if audit:
+            self.audit.record(
+                AuditAction.LOGOUT_ALL, actor_id=user.id, target_type="user", target_id=user.id
+            )
         if commit:
             await self.session.commit()
 

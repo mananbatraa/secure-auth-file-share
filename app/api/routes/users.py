@@ -11,6 +11,7 @@ from app.core.errors import Conflict, NotFound
 from app.core.rbac import Permission
 from app.models import User
 from app.schemas.auth import UserAdminUpdate, UserOut
+from app.services.audit import AuditAction
 
 router = APIRouter(tags=["users"])
 
@@ -49,16 +50,23 @@ async def update_user(
         (body.role is not None and body.role != admin.role) or body.is_active is False
     ):
         raise Conflict("Admins cannot demote or deactivate themselves")
-    changed = False
+    changes: dict[str, dict[str, object]] = {}
     if body.role is not None and body.role != target.role:
+        changes["role"] = {"from": target.role.value, "to": body.role.value}
         target.role = body.role
-        changed = True
     if body.is_active is not None and body.is_active != target.is_active:
+        changes["is_active"] = {"from": target.is_active, "to": body.is_active}
         target.is_active = body.is_active
-        changed = True
-    if changed:
+    if changes:
         # New role or deactivation must apply now, not when old tokens expire.
-        await auth.revoke_all_sessions(target, commit=False)
+        await auth.revoke_all_sessions(target, commit=False, audit=False)
+        auth.audit.record(
+            AuditAction.USER_UPDATED,
+            actor_id=admin.id,
+            target_type="user",
+            target_id=target.id,
+            changes=changes,
+        )
     await session.commit()
     await session.refresh(target)
     return UserOut.model_validate(target)

@@ -13,6 +13,7 @@ from app.api.deps import (
     ResourcesDep,
     SessionDep,
 )
+from app.core.errors import RateLimited
 from app.core.security import hash_opaque_token
 from app.schemas.auth import (
     ChangePasswordRequest,
@@ -22,6 +23,7 @@ from app.schemas.auth import (
     TokenPair,
     UserOut,
 )
+from app.services.audit import AuditAction, Outcome
 from app.services.auth import IssuedTokens, normalize_email
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -51,16 +53,24 @@ async def login(
     # Two buckets: per source IP (spraying many accounts) and per account (targeted
     # guessing from many IPs). Every attempt counts; success clears the account bucket.
     email_key = f"login:email:{hash_opaque_token(normalize_email(body.email))}"
-    await limiter.enforce(
-        f"login:ip:{client.ip_address}",
-        limit=settings.login_max_attempts_per_ip,
-        window_seconds=settings.login_window_seconds,
-    )
-    await limiter.enforce(
-        email_key,
-        limit=settings.login_max_attempts_per_email,
-        window_seconds=settings.login_window_seconds,
-    )
+    try:
+        await limiter.enforce(
+            f"login:ip:{client.ip_address}",
+            limit=settings.login_max_attempts_per_ip,
+            window_seconds=settings.login_window_seconds,
+        )
+        await limiter.enforce(
+            email_key,
+            limit=settings.login_max_attempts_per_email,
+            window_seconds=settings.login_window_seconds,
+        )
+    except RateLimited:
+        await auth.audit.record_now(
+            AuditAction.LOGIN_THROTTLED,
+            outcome=Outcome.FAILURE,
+            email=normalize_email(body.email),
+        )
+        raise
     tokens = await auth.login(body.email, body.password, client)
     await limiter.reset(email_key)
     return _pair(tokens)
@@ -109,5 +119,12 @@ async def oauth_callback(
 ) -> TokenPair:
     identity = await oauth.exchange_code(provider, code, state)
     user = await oauth.resolve_user(session, identity)
+    auth.audit.record(
+        AuditAction.OAUTH_LOGIN,
+        actor_id=user.id,
+        target_type="user",
+        target_id=user.id,
+        provider=identity.provider,
+    )
     tokens, _ = await auth.issue_tokens(user, client)
     return _pair(tokens)

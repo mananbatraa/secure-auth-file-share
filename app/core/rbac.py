@@ -18,6 +18,7 @@ class Permission(StrEnum):
     FILES_MANAGE_ANY = "files:manage_any"
     USERS_READ = "users:read"
     USERS_MANAGE = "users:manage"
+    AUDIT_READ = "audit:read"
 
 
 ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {

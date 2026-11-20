@@ -9,12 +9,15 @@ import httpx
 import pytest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
 from app.main import create_app
+from app.models import AuditEvent
 from app.resources import Resources
 from app.services.rate_limit import SlidingWindowLimiter
-from tests.conftest import PASSWORD
+from tests.conftest import PASSWORD, TABLES
 
 REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 
@@ -31,7 +34,7 @@ async def real_redis() -> Redis:
 
 
 async def test_lifespan_wires_real_dependencies(
-    settings: Settings, engine: object, real_redis: Redis
+    settings: Settings, engine: AsyncEngine, real_redis: Redis
 ) -> None:
     cfg = settings.model_copy(
         update={
@@ -68,10 +71,16 @@ async def test_lifespan_wires_real_dependencies(
             # With trusted proxy headers the client IP comes from X-Forwarded-For.
             assert await real_redis.exists("rl:login:ip:203.0.113.7")
         resources: Resources = app.state.resources
+        async with resources.sessionmaker() as s:
+            login = await s.scalar(select(AuditEvent).where(AuditEvent.action == "auth.login"))
+        assert login is not None
+        assert login.ip_address == "203.0.113.7"
     # Resources the app built itself are closed on shutdown.
     assert resources.http.is_closed
     await real_redis.flushdb()
     await real_redis.aclose()
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {TABLES} CASCADE"))
 
 
 async def test_limiter_is_atomic_on_real_redis(real_redis: Redis) -> None:
