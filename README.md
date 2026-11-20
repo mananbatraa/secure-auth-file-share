@@ -10,29 +10,33 @@ A FastAPI backend with production-style authentication and file sharing:
 - **RBAC** (`admin`, `member`, `guest`) mapped to explicit permissions.
 - **Rate-limited login**: Redis sliding-window limits per account and per IP, run atomically in one Lua script.
 - **File sharing on S3/MinIO**: uploads are hashed and size-capped, downloads go through **short-lived presigned URLs**, per-file **viewer/editor grants** (optionally expiring), and anonymous **share links** with an expiry and an optional download cap that holds under concurrency.
-- Postgres via async SQLAlchemy 2, **Alembic** migrations, Docker Compose stack, CI on GitHub Actions, **140 tests at 98% coverage**, `ruff` + strict `mypy`.
+- **Direct-to-S3 uploads** for large files: a presigned POST pinned to the key, exact size, content type and SHA-256, followed by a confirm step that re-verifies the stored object and deletes anything that doesn't match.
+- **Append-only audit log** of every security-relevant event (logins with failure reason, throttling, token reuse, admin changes, grants, share-link use), enforced by a Postgres trigger and queryable by admins.
+- Postgres via async SQLAlchemy 2, **Alembic** migrations, Docker Compose stack, CI on GitHub Actions, **180 tests at 98% coverage**, `ruff` + strict `mypy`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     C[Client / SPA] -->|Bearer JWT| API[FastAPI app]
-    C -->|presigned GET| S3[(S3 / MinIO)]
+    C -->|presigned GET / POST| S3[(S3 / MinIO)]
     B[Anyone with a link] -->|GET /s/token| API
     API -->|307 to presigned URL| B
-    API --> PG[(Postgres<br/>users, refresh_tokens,<br/>files, grants, links)]
+    API --> PG[(Postgres<br/>users, refresh_tokens, files,<br/>grants, links, upload_intents,<br/>audit_events)]
     API --> R[(Redis<br/>rate limits, OAuth state)]
     API -->|upload / delete| S3
     API -->|code exchange| OP[GitHub / Google OAuth]
 ```
 
-File bytes never stream back through the API. The API authorizes the request, then hands the client a presigned URL that is valid for seconds or minutes.
+File bytes never stream back through the API. The API authorizes the request, then hands the client a presigned URL that is valid for seconds or minutes. Large uploads can skip the API too (see below).
 
 ```
 app/
   core/       config (env vars), security (Argon2id, JWT), RBAC, domain errors
-  models/     SQLAlchemy models: User, OAuthAccount, RefreshToken, StoredFile, FilePermission, ShareLink
-  services/   auth (rotation), oauth, files (permissions, links), storage (S3), rate_limit (Lua)
+  models/     SQLAlchemy models: User, OAuthAccount, RefreshToken, StoredFile, FilePermission,
+              ShareLink, UploadIntent, AuditEvent
+  services/   auth (rotation), oauth, files (permissions, links, direct uploads), storage (S3),
+              rate_limit (Lua), audit
   api/        routes + dependencies (current user, permission checks)
   resources.py  process-wide pools/clients, built in the app lifespan
 alembic/      migrations
@@ -56,6 +60,40 @@ sequenceDiagram
 ```
 
 The token row is read with `SELECT … FOR UPDATE`, so two simultaneous refreshes with the same token serialize: exactly one wins, and the other is treated as a replay.
+
+### Direct-to-S3 uploads
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as API
+    participant O as S3 / MinIO
+    C->>S: POST /files/uploads {filename, content_type, size_bytes, sha256?}
+    S->>S: insert upload_intent (owner, key, declared size/type/hash, expiry)
+    S-->>C: presigned POST (policy: this key, exact size, this type, checksum)
+    C->>O: POST file bytes (never touch the API)
+    C->>S: POST /files/uploads/{id}/complete
+    S->>O: HEAD object (size, type, stored SHA-256)
+    alt everything matches
+        S->>S: intent becomes a file row (same id), audit file.uploaded
+        S-->>C: 201 file
+    else mismatch / expired
+        S->>O: DELETE object
+        S-->>C: 422 / 410, audit file.upload_rejected
+    end
+```
+
+S3 enforces the POST policy, but the confirm step does not rely on it: it compares the stored object with what was declared, using S3's stored full-object SHA-256 when there is one and otherwise streaming the object to hash it. Intents are single-use, owner-scoped (another user gets `404`) and expire with the policy.
+
+### Audit log
+
+Every security-relevant action writes an `audit_events` row with the actor, target, outcome, client IP, user agent and request ID. Success events are staged in the same transaction as the action, so an action and its audit row commit or roll back together; failures (bad password, throttled login, rejected share link) are written on their own because the action itself never commits. A trigger rejects `UPDATE` and `DELETE` on the table, and `actor_id` has no foreign key, so the trail survives user deletion.
+
+```bash
+# Failed logins in the last hour, newest first; follow next_before_id to page
+curl -s "$API/admin/audit?action=auth.login&outcome=failure&since=2026-11-20T10:00:00Z" \
+  -H "authorization: Bearer $ADMIN_AT"
+```
 
 ## Running it
 
@@ -102,7 +140,7 @@ uv run uvicorn app.main:app_factory --factory --reload
 ```bash
 docker compose up -d postgres redis
 createdb -h localhost -U postgres fileshare_test   # once
-uv run pytest --cov=app        # 140 tests
+uv run pytest --cov=app        # 180 tests
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
@@ -123,11 +161,14 @@ The test suite runs migrations from scratch, then exercises the API against real
 | GET | `/users/me` | user | |
 | GET/PATCH | `/admin/users[/{id}]` | admin | change role / deactivate (takes effect immediately) |
 | POST/GET | `/files` | member+ / user | multipart upload (`upload` field); list `?scope=owned\|shared\|all` |
+| POST | `/files/uploads` | member+ | start a direct-to-S3 upload; returns presigned POST `url` + `fields` |
+| POST | `/files/uploads/{id}/complete` | uploader | verify the object and create the file |
 | GET/PATCH/DELETE | `/files/{id}` | viewer / editor / owner | |
 | GET | `/files/{id}/download?ttl=` | viewer | presigned URL, TTL clamped to server max |
 | POST/GET/DELETE | `/files/{id}/permissions[/{user_id}]` | owner | grant `viewer`/`editor`, optional expiry |
 | POST/GET/DELETE | `/files/{id}/links[/{link_id}]` | owner | anonymous links, expiry + download cap |
 | GET | `/s/{token}` | anyone | `307` to a 60 s presigned URL; `410` if expired, revoked or used up |
+| GET | `/admin/audit` | admin | filter by `action` (exact or `prefix.`), `outcome`, `actor_id`, `target_type`/`target_id`, `since`/`until`; keyset paging via `before_id` |
 | GET | `/healthz`, `/readyz` | anyone | readiness checks Postgres, Redis and S3 |
 
 Errors share one shape: `{"error": {"code": "permission_denied", "message": "..."}}`.
@@ -144,6 +185,8 @@ Errors share one shape: `{"error": {"code": "permission_denied", "message": "...
 - **Atomic download caps.** Redeeming a share link is a single conditional `UPDATE … WHERE download_count < max_downloads RETURNING`. Twelve concurrent hits on a 3-download link give exactly three redirects (there is a test for this).
 - **Argon2id** password hashing. Unknown emails still run a dummy verification, so response time doesn't reveal which accounts exist.
 - **PKCE on OAuth** even for confidential clients, plus single-use `state` stored in Redis (`GETDEL`) and bound to the provider. Accounts are linked by email only when the provider says that email is verified; otherwise an attacker could take over an existing account.
+- **Verify uploads after the fact.** A presigned POST policy is only as good as the storage backend that enforces it (moto, for one, ignores it). The confirm step checks size, content type and checksum against the stored object, so a client can't swap in different bytes, even against a lax backend.
+- **Audit ids are a Postgres identity, not UUIDs.** `created_at` is the transaction start time, so events inside one transaction tie; a monotonically increasing id gives a total order and a cheap keyset cursor. Retention would be done by a privileged role (or by partitioning by month and dropping old partitions), never by the app's own credentials.
 - **Pinned JWT algorithm and audience/issuer checks.** `alg=none` and algorithm substitution are rejected (there are tests for both).
 
 ## Configuration

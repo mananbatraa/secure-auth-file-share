@@ -13,22 +13,28 @@ Handoff notes between build runs. Slot: Nov 20-21 2026 (four runs; the Nov 20 mo
 - Alembic initial migration (reversible, drift test), Dockerfile (non-root, healthcheck), docker-compose (API, migrate, Postgres, Redis, MinIO), GitHub Actions CI (ruff, strict mypy, tests with Postgres + Redis services, coverage, Docker build).
 - README with Mermaid architecture and rotation diagrams, design decisions, API table.
 
+## Done (Nov 20, evening run)
+
+- First CI run on main was green (lint, tests, Docker build).
+- **Audit log**: `audit_events` table (migration 0002) with an append-only trigger (UPDATE/DELETE raise), identity id for total ordering, no FK on actor so rows outlive users. `AuditLog` service stages success events in the action's own transaction and writes failures separately (`record_now`, which never turns a 4xx into a 500). Covers register, login success/failure (with reason), throttled logins, refresh-token reuse, logout, logout-all, password change, OAuth login, admin user changes (with a from/to diff), and the whole file lifecycle including anonymous share-link redemption and rejection. `GET /admin/audit` (new `audit:read` permission, admin only) with filters and keyset pagination.
+- **Direct-to-S3 uploads** (migration 0003, `upload_intents`): `POST /files/uploads` returns a presigned POST pinned to key, exact size, content type and optional SHA-256; `POST /files/uploads/{id}/complete` re-verifies the stored object (S3 stored checksum, else streamed hash), deletes mismatches, and turns the intent into a file with the same id. Single-use, owner-scoped, expiring.
+- Fixed a test leak: the lifespan test now truncates the rows it creates.
+- README: new feature bullets, upload sequence diagram, audit section, API table rows, two new design decisions. `.env.example` has the new settings.
+
 ## Test status
 
-- 140 passed, 0 failed (`uv run pytest`), 98% line+branch coverage.
+- 180 passed, 0 failed (`uv run pytest`), 98% line+branch coverage.
 - `ruff check`, `ruff format --check`, `mypy --strict` (app + tests) all clean.
 - Docker image not built in the sandbox (package downloads are blocked there); CI builds it.
 
 ## Next steps (ideas for the remaining runs)
 
-1. Confirm the first CI run is green (look at Actions on the repo); fix anything that differs from local.
-2. Direct-to-S3 uploads via presigned POST (with a size condition), then a `confirm` endpoint, so large files skip the API.
-3. Audit log table (logins, reuse detections, shares, downloads) + `GET /admin/audit`.
-4. Optional refresh token in an HttpOnly, SameSite=strict cookie for browser clients.
-5. Email verification for password sign-ups (token table + endpoint; mock mailer in tests).
-6. Background cleanup job for expired refresh tokens, grants and links.
-7. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README.
-8. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
+1. Check CI is green for this run's push.
+2. Background cleanup (e.g. `python -m app.cleanup`, run by a compose service or cron): delete expired upload intents and their S3 objects, expired refresh tokens, grants and links.
+3. Optional refresh token in an HttpOnly, SameSite=strict cookie for browser clients (with CSRF protection on `/auth/refresh`).
+4. Email verification for password sign-ups (token table + endpoint; mock mailer in tests).
+5. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README.
+6. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
 
 ## Local test setup used in the sandbox
 
