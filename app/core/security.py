@@ -51,6 +51,16 @@ def hash_opaque_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def csrf_token_for(settings: Settings, refresh_token: str) -> str:
+    """The CSRF token paired with a cookie-held refresh token (signed double submit).
+
+    Derived from the refresh token with the server key, so it rotates with it, cannot
+    be forged by someone who can only plant cookies, and needs no storage.
+    """
+    key = settings.jwt_secret.get_secret_value().encode()
+    return hmac.new(key, b"csrf:" + refresh_token.encode(), hashlib.sha256).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class AccessClaims:
     user_id: uuid.UUID

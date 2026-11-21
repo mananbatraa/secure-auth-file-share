@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Query, status
+from fastapi import APIRouter, BackgroundTasks, Body, Query, Request, status
 from fastapi.responses import RedirectResponse, Response
 
+from app.api import session_cookies
 from app.api.deps import (
     AuthServiceDep,
     ClientDep,
@@ -115,8 +116,14 @@ async def confirm_password_reset(body: PasswordResetConfirm, reset: PasswordRese
 
 @router.post("/login", response_model=TokenPair)
 async def login(
-    body: LoginRequest, auth: AuthServiceDep, client: ClientDep, resources: ResourcesDep
+    body: LoginRequest,
+    auth: AuthServiceDep,
+    client: ClientDep,
+    resources: ResourcesDep,
+    request: Request,
+    response: Response,
 ) -> TokenPair:
+    """Sign in. Send ``X-Token-Delivery: cookie`` to get the refresh token as a cookie."""
     settings = resources.settings
     limiter = resources.limiter
     # Two buckets: per source IP (spraying many accounts) and per account (targeted
@@ -142,18 +149,48 @@ async def login(
         raise
     tokens = await auth.login(body.email, body.password, client)
     await limiter.reset(email_key)
-    return _pair(tokens)
+    return session_cookies.deliver(
+        tokens, response, settings, cookie=session_cookies.wants_cookie(request)
+    )
+
+
+OptionalRefresh = Annotated[RefreshRequest | None, Body()]
 
 
 @router.post("/refresh", response_model=TokenPair)
-async def refresh(body: RefreshRequest, auth: AuthServiceDep, client: ClientDep) -> TokenPair:
-    return _pair(await auth.rotate(body.refresh_token, client))
+async def refresh(
+    auth: AuthServiceDep,
+    client: ClientDep,
+    resources: ResourcesDep,
+    request: Request,
+    response: Response,
+    body: OptionalRefresh = None,
+) -> TokenPair:
+    """Rotate a refresh token from the body, or from the cookie with ``X-CSRF-Token``."""
+    settings = resources.settings
+    raw, from_cookie = session_cookies.refresh_token_from(
+        request, body.refresh_token if body else None, settings
+    )
+    tokens = await auth.rotate(raw, client)
+    return session_cookies.deliver(tokens, response, settings, cookie=from_cookie)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
-async def logout(body: RefreshRequest, auth: AuthServiceDep) -> Response:
-    await auth.logout(body.refresh_token)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+async def logout(
+    auth: AuthServiceDep,
+    resources: ResourcesDep,
+    request: Request,
+    body: OptionalRefresh = None,
+) -> Response:
+    settings = resources.settings
+    raw, from_cookie = session_cookies.refresh_token_from(
+        request, body.refresh_token if body else None, settings
+    )
+    await auth.logout(raw)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    if from_cookie:
+        session_cookies.clear(response, settings)
+    return response
 
 
 @router.post("/logout-all", status_code=status.HTTP_204_NO_CONTENT)

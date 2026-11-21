@@ -56,9 +56,10 @@ def create_app(settings: Settings | None = None, resources: Resources | None = N
         app.add_middleware(
             CORSMiddleware,
             allow_origins=settings.cors_origins,
-            allow_credentials=False,
+            # Credentials so browsers send the refresh cookie; origins are explicit.
+            allow_credentials=True,
             allow_methods=["*"],
-            allow_headers=["Authorization", "Content-Type"],
+            allow_headers=["Authorization", "Content-Type", "X-CSRF-Token", "X-Token-Delivery"],
         )
 
     @app.middleware("http")

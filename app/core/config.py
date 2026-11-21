@@ -42,6 +42,16 @@ class Settings(BaseSettings):
     # When Redis is unreachable: fail closed (reject logins) unless explicitly opted out.
     rate_limit_fail_open: bool = False
 
+    # --- browser sessions (refresh token in an HttpOnly cookie) --------------------------
+    # Clients opt in per request with "X-Token-Delivery: cookie" on /auth/login. The
+    # refresh token then never reaches JavaScript; /auth/refresh and /auth/logout read it
+    # from the cookie and require a matching X-CSRF-Token header.
+    refresh_cookie_name: str = "safs_refresh"
+    csrf_cookie_name: str = "safs_csrf"
+    # Keep True outside local plain-HTTP development.
+    cookie_secure: bool = True
+    cookie_domain: str | None = None
+
     password_min_length: int = Field(default=12, ge=8)
 
     # --- email verification -------------------------------------------------------------
@@ -121,6 +131,11 @@ class Settings(BaseSettings):
             raise ValueError("EMAIL_VERIFICATION_URL must contain {token}")
         if "{token}" not in self.password_reset_url:
             raise ValueError("PASSWORD_RESET_URL must contain {token}")
+        if "*" in self.cors_origins:
+            # CORS with credentials (needed for the refresh cookie) forbids a wildcard.
+            raise ValueError("CORS_ORIGINS must list explicit origins, not *")
+        if self.environment == "production" and not self.cookie_secure:
+            raise ValueError("COOKIE_SECURE must be true in production")
         if self.download_url_default_ttl_seconds > self.download_url_max_ttl_seconds:
             raise ValueError("DOWNLOAD_URL_DEFAULT_TTL_SECONDS exceeds the max TTL")
         return self

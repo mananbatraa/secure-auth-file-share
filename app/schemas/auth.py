@@ -30,10 +30,13 @@ class ChangePasswordRequest(BaseModel):
 
 class TokenPair(BaseModel):
     access_token: str
-    refresh_token: str
+    # None when the refresh token was delivered as an HttpOnly cookie instead.
+    refresh_token: str | None
     token_type: Literal["bearer"] = "bearer"  # noqa: S105
     expires_in: int
     refresh_expires_in: int
+    # Cookie delivery only: echo this in X-CSRF-Token on /auth/refresh and /auth/logout.
+    csrf_token: str | None = None
 
 
 class UserOut(BaseModel):

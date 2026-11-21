@@ -50,6 +50,13 @@ class PermissionDenied(AppError):
         super().__init__(message)
 
 
+class CsrfFailed(PermissionDenied):
+    code = "csrf_failed"
+
+    def __init__(self) -> None:
+        super().__init__("Missing or invalid X-CSRF-Token header")
+
+
 class EmailNotVerified(PermissionDenied):
     code = "email_not_verified"
 
