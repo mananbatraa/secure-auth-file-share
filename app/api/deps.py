@@ -18,6 +18,7 @@ from app.services.auth import AuthService, ClientInfo
 from app.services.email_verification import EmailVerificationService
 from app.services.files import FileService
 from app.services.oauth import OAuthService
+from app.services.password_reset import PasswordResetService
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -78,6 +79,13 @@ def get_email_verification(
 
 
 EmailVerificationDep = Annotated[EmailVerificationService, Depends(get_email_verification)]
+
+
+def get_password_reset(auth: AuthServiceDep, settings: SettingsDep) -> PasswordResetService:
+    return PasswordResetService(auth, settings)
+
+
+PasswordResetDep = Annotated[PasswordResetService, Depends(get_password_reset)]
 
 
 def get_file_service(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -13,7 +14,7 @@ import jwt
 from pwdlib import PasswordHash
 
 from app.core.config import Settings
-from app.core.errors import InvalidToken, InvalidVerificationToken
+from app.core.errors import InvalidResetToken, InvalidToken, InvalidVerificationToken
 
 _password_hash = PasswordHash.recommended()  # Argon2id
 # Verified against when the user does not exist, so login timing doesn't leak which
@@ -124,6 +125,72 @@ def decode_email_verification_token(settings: Settings, token: str) -> tuple[uui
         return uuid.UUID(payload["sub"]), str(payload["eml"])
     except (jwt.PyJWTError, ValueError, TypeError) as exc:
         raise InvalidVerificationToken() from exc
+
+
+def _password_reset_audience(settings: Settings) -> str:
+    return f"{settings.jwt_audience}:password-reset"
+
+
+def password_fingerprint(settings: Settings, hashed_password: str | None) -> str:
+    """A keyed digest of the *current* password hash (empty for password-less accounts).
+
+    A reset token carries it, so the token dies as soon as the password changes: the
+    reset itself, a change-password, or an OAuth link that removes the password. That
+    makes the token single-use without a table. It is an HMAC, not a plain hash, so the
+    (readable) token reveals nothing about the stored hash.
+    """
+    key = settings.jwt_secret.get_secret_value().encode()
+    msg = (hashed_password or "").encode()
+    return hmac.new(key, b"password-reset:" + msg, hashlib.sha256).hexdigest()
+
+
+def create_password_reset_token(
+    settings: Settings, *, user_id: uuid.UUID, email: str, hashed_password: str | None
+) -> str:
+    """A short-lived token bound to the user, their address and their current password."""
+    now = utcnow()
+    payload: dict[str, Any] = {
+        "sub": str(user_id),
+        "eml": email_fingerprint(email),
+        "pwd": password_fingerprint(settings, hashed_password),
+        "type": "password_reset",
+        "iss": settings.jwt_issuer,
+        "aud": _password_reset_audience(settings),
+        "iat": now,
+        "exp": now + timedelta(seconds=settings.password_reset_ttl_seconds),
+    }
+    return jwt.encode(
+        payload, settings.jwt_secret.get_secret_value(), algorithm=settings.jwt_algorithm
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PasswordResetClaims:
+    user_id: uuid.UUID
+    email_fingerprint: str
+    password_fingerprint: str
+
+
+def decode_password_reset_token(settings: Settings, token: str) -> PasswordResetClaims:
+    """Check signature, audience and expiry; raises :class:`InvalidResetToken`."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=[settings.jwt_algorithm],
+            audience=_password_reset_audience(settings),
+            issuer=settings.jwt_issuer,
+            options={"require": ["sub", "exp", "iat", "type", "eml", "pwd"]},
+        )
+        if payload.get("type") != "password_reset":
+            raise InvalidResetToken()
+        return PasswordResetClaims(
+            user_id=uuid.UUID(payload["sub"]),
+            email_fingerprint=str(payload["eml"]),
+            password_fingerprint=str(payload["pwd"]),
+        )
+    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+        raise InvalidResetToken() from exc
 
 
 def decode_access_token(settings: Settings, token: str) -> AccessClaims:

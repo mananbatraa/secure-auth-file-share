@@ -31,6 +31,8 @@ class AuditAction(StrEnum):
     EMAIL_VERIFIED = "auth.email_verified"
     UNVERIFIED_PASSWORD_REMOVED = "auth.unverified_password_removed"  # noqa: S105
     PASSWORD_CHANGED = "auth.password_changed"  # noqa: S105 - an event name
+    PASSWORD_RESET_REQUESTED = "auth.password_reset_requested"  # noqa: S105
+    PASSWORD_RESET = "auth.password_reset"  # noqa: S105
     USER_UPDATED = "admin.user_updated"
     FILE_UPLOADED = "file.uploaded"
     FILE_UPLOAD_REJECTED = "file.upload_rejected"

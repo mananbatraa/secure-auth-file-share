@@ -51,6 +51,15 @@ class VerifyEmailRequest(BaseModel):
     token: str = Field(min_length=16, max_length=2048)
 
 
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    token: str = Field(min_length=16, max_length=2048)
+    new_password: str = Field(min_length=1, max_length=256)
+
+
 class UserAdminUpdate(BaseModel):
     role: Role | None = None
     is_active: bool | None = None

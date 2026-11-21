@@ -65,6 +65,14 @@ class InvalidVerificationToken(AppError):
         super().__init__("Invalid or expired verification link")
 
 
+class InvalidResetToken(AppError):
+    status_code = 400
+    code = "invalid_reset_token"
+
+    def __init__(self) -> None:
+        super().__init__("Invalid or expired password reset link")
+
+
 class NotFound(AppError):
     status_code = 404
     code = "not_found"

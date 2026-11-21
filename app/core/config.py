@@ -54,6 +54,15 @@ class Settings(BaseSettings):
     email_verification_url: str = "http://localhost:3000/verify-email?token={token}"
     email_verification_resend_limit: int = Field(default=3, ge=1)
     email_verification_resend_window_seconds: int = Field(default=3600, ge=1)
+    # --- password reset -----------------------------------------------------------------
+    password_reset_ttl_seconds: int = Field(default=1800, ge=60, le=24 * 3600)
+    # Your frontend page, which POSTs the token and a new password to
+    # /auth/password-reset/confirm. Must contain "{token}".
+    password_reset_url: str = "http://localhost:3000/reset-password?token={token}"  # noqa: S105
+    password_reset_max_per_email: int = Field(default=3, ge=1)
+    password_reset_max_per_ip: int = Field(default=10, ge=1)
+    password_reset_window_seconds: int = Field(default=3600, ge=1)
+
     # Without SMTP_HOST the email is only logged (development).
     smtp_host: str | None = None
     smtp_port: int = 587
@@ -110,6 +119,8 @@ class Settings(BaseSettings):
                 raise ValueError("JWT_SECRET must be at least 32 characters")
         if "{token}" not in self.email_verification_url:
             raise ValueError("EMAIL_VERIFICATION_URL must contain {token}")
+        if "{token}" not in self.password_reset_url:
+            raise ValueError("PASSWORD_RESET_URL must contain {token}")
         if self.download_url_default_ttl_seconds > self.download_url_max_ttl_seconds:
             raise ValueError("DOWNLOAD_URL_DEFAULT_TTL_SECONDS exceeds the max TTL")
         return self

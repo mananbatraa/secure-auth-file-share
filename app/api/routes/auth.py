@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, BackgroundTasks, Query, status
 from fastapi.responses import RedirectResponse, Response
 
 from app.api.deps import (
@@ -11,6 +11,7 @@ from app.api.deps import (
     CurrentUser,
     EmailVerificationDep,
     OAuthServiceDep,
+    PasswordResetDep,
     ResourcesDep,
     SessionDep,
 )
@@ -19,6 +20,8 @@ from app.core.security import hash_opaque_token
 from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
+    PasswordResetConfirm,
+    PasswordResetRequest,
     RefreshRequest,
     RegisterRequest,
     TokenPair,
@@ -27,6 +30,7 @@ from app.schemas.auth import (
 )
 from app.services.audit import AuditAction, Outcome
 from app.services.auth import IssuedTokens, normalize_email
+from app.services.password_reset import deliver_quietly
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -71,6 +75,42 @@ async def resend_verification(
     )
     await verification.send(user)
     return {"status": "sent"}
+
+
+@router.post("/password-reset/request", status_code=status.HTTP_202_ACCEPTED)
+async def request_password_reset(
+    body: PasswordResetRequest,
+    reset: PasswordResetDep,
+    client: ClientDep,
+    resources: ResourcesDep,
+    background: BackgroundTasks,
+) -> dict[str, str]:
+    """Email a reset link if the account exists. The answer is the same either way."""
+    settings = resources.settings
+    email = normalize_email(body.email)
+    # Keyed on the address whether or not it exists, so a 429 reveals nothing either.
+    await resources.limiter.enforce(
+        f"pwreset:ip:{client.ip_address}",
+        limit=settings.password_reset_max_per_ip,
+        window_seconds=settings.password_reset_window_seconds,
+    )
+    await resources.limiter.enforce(
+        f"pwreset:email:{hash_opaque_token(email)}",
+        limit=settings.password_reset_max_per_email,
+        window_seconds=settings.password_reset_window_seconds,
+    )
+    mail = await reset.request(email)
+    if mail is not None:
+        # Sent after the response, so response time doesn't reveal the account exists.
+        background.add_task(deliver_quietly, resources.mailer, mail)
+    return {"status": "accepted"}
+
+
+@router.post("/password-reset/confirm", status_code=status.HTTP_204_NO_CONTENT)
+async def confirm_password_reset(body: PasswordResetConfirm, reset: PasswordResetDep) -> Response:
+    """Set a new password with the emailed token. Signs the user out everywhere."""
+    await reset.confirm(body.token, body.new_password)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/login", response_model=TokenPair)
