@@ -50,6 +50,21 @@ class PermissionDenied(AppError):
         super().__init__(message)
 
 
+class EmailNotVerified(PermissionDenied):
+    code = "email_not_verified"
+
+    def __init__(self) -> None:
+        super().__init__("Verify your email address before uploading or sharing files")
+
+
+class InvalidVerificationToken(AppError):
+    status_code = 400
+    code = "invalid_verification_token"
+
+    def __init__(self) -> None:
+        super().__init__("Invalid or expired verification link")
+
+
 class NotFound(AppError):
     status_code = 404
     code = "not_found"

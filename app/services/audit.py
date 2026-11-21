@@ -27,6 +27,9 @@ class AuditAction(StrEnum):
     REFRESH_REUSE = "auth.refresh_reuse_detected"
     LOGOUT = "auth.logout"
     LOGOUT_ALL = "auth.logout_all"
+    EMAIL_VERIFICATION_SENT = "auth.email_verification_sent"
+    EMAIL_VERIFIED = "auth.email_verified"
+    UNVERIFIED_PASSWORD_REMOVED = "auth.unverified_password_removed"  # noqa: S105
     PASSWORD_CHANGED = "auth.password_changed"  # noqa: S105 - an event name
     USER_UPDATED = "admin.user_updated"
     FILE_UPLOADED = "file.uploaded"

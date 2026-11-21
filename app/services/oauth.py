@@ -16,14 +16,15 @@ from urllib.parse import urlencode
 import httpx
 import structlog
 from redis.asyncio import Redis
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.core.errors import NotFound, OAuthError, PermissionDenied
-from app.core.security import new_opaque_token
-from app.models import OAuthAccount, User
+from app.core.security import new_opaque_token, utcnow
+from app.models import OAuthAccount, RefreshToken, User
+from app.services.audit import AuditAction, AuditLog
 from app.services.auth import normalize_email
 
 log = structlog.get_logger(__name__)
@@ -168,8 +169,18 @@ class OAuthService:
             "google", str(info["sub"]), info["email"], bool(info.get("email_verified"))
         )
 
-    async def resolve_user(self, session: AsyncSession, identity: OAuthIdentity) -> User:
-        """Find the linked user, link by verified email, or create a new account."""
+    async def resolve_user(
+        self, session: AsyncSession, identity: OAuthIdentity, audit: AuditLog | None = None
+    ) -> User:
+        """Find the linked user, link by verified email, or create a new account.
+
+        A provider-verified email also verifies the local account. Linking to an existing
+        account whose email was never verified is the classic *pre-account-takeover*
+        setup (an attacker registers the victim's address with a password and waits for
+        the victim to sign in with Google), so that unproven password is removed and its
+        sessions revoked before the link is made.
+        """
+        audit = audit or AuditLog(session)
         link = await session.scalar(
             select(OAuthAccount).where(
                 OAuthAccount.provider == identity.provider,
@@ -180,6 +191,13 @@ class OAuthService:
             user = await session.get(User, link.user_id)
             if user is None or not user.is_active:
                 raise PermissionDenied("Account is disabled")
+            if (
+                not user.email_verified
+                and identity.email_verified
+                and normalize_email(identity.email) == user.email
+            ):
+                user.email_verified_at = utcnow()
+                await session.commit()
             return user
 
         if not identity.email_verified:
@@ -188,11 +206,29 @@ class OAuthService:
         email = normalize_email(identity.email)
         user = await session.scalar(select(User).where(User.email == email))
         if user is None:
-            user = User(email=email, hashed_password=None)
+            user = User(email=email, hashed_password=None, email_verified_at=utcnow())
             session.add(user)
             await session.flush()
         elif not user.is_active:
             raise PermissionDenied("Account is disabled")
+        elif not user.email_verified:
+            if user.hashed_password is not None:
+                user.hashed_password = None
+                user.token_version += 1
+                await session.execute(
+                    update(RefreshToken)
+                    .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
+                    .values(revoked_at=utcnow())
+                )
+                audit.record(
+                    AuditAction.UNVERIFIED_PASSWORD_REMOVED,
+                    actor_id=user.id,
+                    target_type="user",
+                    target_id=user.id,
+                    provider=identity.provider,
+                )
+                log.warning("unverified_password_removed", user_id=str(user.id))
+            user.email_verified_at = utcnow()
         session.add(
             OAuthAccount(
                 user_id=user.id,

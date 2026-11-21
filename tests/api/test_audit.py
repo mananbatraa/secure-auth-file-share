@@ -50,8 +50,9 @@ async def test_register_and_login_are_recorded_with_client_context(
         headers={"User-Agent": "audit-test/1.0", "X-Request-ID": "req-123"},
     )
     assert r.status_code == 200
-    reg, login = await events(resources)
+    reg, mailed, login = await events(resources)
     assert (reg.action, reg.outcome, str(reg.actor_id)) == ("auth.register", "success", user_id)
+    assert (mailed.action, str(mailed.actor_id)) == ("auth.email_verification_sent", user_id)
     assert (login.action, login.outcome, str(login.actor_id)) == ("auth.login", "success", user_id)
     assert login.user_agent == "audit-test/1.0"
     assert login.request_id == "req-123"
@@ -140,6 +141,7 @@ async def test_session_and_password_events(
     actions = [(e.action, e.outcome) for e in await events(resources) if e.action != "auth.login"]
     assert actions == [
         ("auth.register", "success"),
+        ("auth.email_verification_sent", "success"),
         ("auth.logout", "success"),
         ("auth.password_changed", "failure"),
         ("auth.password_changed", "success"),
@@ -291,7 +293,7 @@ async def test_audit_rows_cannot_be_modified(
         with pytest.raises(DBAPIError, match="append-only"):
             await s.execute(text(stmt))
         await s.rollback()
-    assert len(await events(resources)) == 2
+    assert len(await events(resources)) == 3  # register, verification mail, login
 
 
 # --- admin API -----------------------------------------------------------------------------
@@ -336,6 +338,7 @@ async def test_audit_api_filters(client: httpx.AsyncClient, make_user: UserFacto
     assert actions(await audit_api(client, admin, action="file.uploaded")) == ["file.uploaded"]
     assert set(actions(await audit_api(client, admin, action="auth."))) == {
         "auth.register",
+        "auth.email_verification_sent",
         "auth.login",
     }
     failures = await audit_api(client, admin, outcome="failure")
@@ -356,7 +359,7 @@ async def test_audit_api_time_window(client: httpx.AsyncClient, make_user: UserF
     past = await audit_api(client, admin, until=(now - timedelta(hours=1)).isoformat())
     assert past["items"] == []
     recent = await audit_api(client, admin, since=(now - timedelta(hours=1)).isoformat())
-    assert len(recent["items"]) == 2
+    assert len(recent["items"]) == 3  # register, verification mail, login
     future = await audit_api(client, admin, since=(now + timedelta(hours=1)).isoformat())
     assert future["items"] == []
 

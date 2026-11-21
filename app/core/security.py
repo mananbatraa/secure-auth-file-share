@@ -13,7 +13,7 @@ import jwt
 from pwdlib import PasswordHash
 
 from app.core.config import Settings
-from app.core.errors import InvalidToken
+from app.core.errors import InvalidToken, InvalidVerificationToken
 
 _password_hash = PasswordHash.recommended()  # Argon2id
 # Verified against when the user does not exist, so login timing doesn't leak which
@@ -80,6 +80,50 @@ def create_access_token(
         payload, settings.jwt_secret.get_secret_value(), algorithm=settings.jwt_algorithm
     )
     return token, expires_at
+
+
+def _verification_audience(settings: Settings) -> str:
+    # A different audience, so a verification token can never pass as an access token.
+    return f"{settings.jwt_audience}:email-verification"
+
+
+def email_fingerprint(email: str) -> str:
+    return hashlib.sha256(email.encode()).hexdigest()
+
+
+def create_email_verification_token(settings: Settings, *, user_id: uuid.UUID, email: str) -> str:
+    """A signed, expiring token bound to the user *and* the address it was sent to."""
+    now = utcnow()
+    payload: dict[str, Any] = {
+        "sub": str(user_id),
+        "eml": email_fingerprint(email),
+        "type": "email_verification",
+        "iss": settings.jwt_issuer,
+        "aud": _verification_audience(settings),
+        "iat": now,
+        "exp": now + timedelta(seconds=settings.email_verification_ttl_seconds),
+    }
+    return jwt.encode(
+        payload, settings.jwt_secret.get_secret_value(), algorithm=settings.jwt_algorithm
+    )
+
+
+def decode_email_verification_token(settings: Settings, token: str) -> tuple[uuid.UUID, str]:
+    """Return ``(user_id, email_fingerprint)``; raises :class:`InvalidVerificationToken`."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=[settings.jwt_algorithm],
+            audience=_verification_audience(settings),
+            issuer=settings.jwt_issuer,
+            options={"require": ["sub", "exp", "iat", "type", "eml"]},
+        )
+        if payload.get("type") != "email_verification":
+            raise InvalidVerificationToken()
+        return uuid.UUID(payload["sub"]), str(payload["eml"])
+    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+        raise InvalidVerificationToken() from exc
 
 
 def decode_access_token(settings: Settings, token: str) -> AccessClaims:

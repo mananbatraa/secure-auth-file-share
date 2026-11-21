@@ -9,11 +9,12 @@ from app.api.deps import (
     AuthServiceDep,
     ClientDep,
     CurrentUser,
+    EmailVerificationDep,
     OAuthServiceDep,
     ResourcesDep,
     SessionDep,
 )
-from app.core.errors import RateLimited
+from app.core.errors import Conflict, RateLimited
 from app.core.security import hash_opaque_token
 from app.schemas.auth import (
     ChangePasswordRequest,
@@ -22,6 +23,7 @@ from app.schemas.auth import (
     RegisterRequest,
     TokenPair,
     UserOut,
+    VerifyEmailRequest,
 )
 from app.services.audit import AuditAction, Outcome
 from app.services.auth import IssuedTokens, normalize_email
@@ -39,9 +41,36 @@ def _pair(tokens: IssuedTokens) -> TokenPair:
 
 
 @router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest, auth: AuthServiceDep) -> UserOut:
+async def register(
+    body: RegisterRequest, auth: AuthServiceDep, verification: EmailVerificationDep
+) -> UserOut:
     user = await auth.register(body.email, body.password)
+    # A mail outage must not fail sign-up; the user can ask for a new link later.
+    await verification.send_quietly(user)
     return UserOut.model_validate(user)
+
+
+@router.post("/verify-email", response_model=UserOut)
+async def verify_email(body: VerifyEmailRequest, verification: EmailVerificationDep) -> UserOut:
+    """Confirm an address with the token from the emailed link. Idempotent."""
+    return UserOut.model_validate(await verification.verify(body.token))
+
+
+@router.post("/verify-email/resend", status_code=status.HTTP_202_ACCEPTED)
+async def resend_verification(
+    user: CurrentUser, verification: EmailVerificationDep, resources: ResourcesDep
+) -> dict[str, str]:
+    settings = resources.settings
+    if user.email_verified:
+        raise Conflict("Email address is already verified")
+    # Each resend is an email to a third-party inbox: cap it per account.
+    await resources.limiter.enforce(
+        f"verify-resend:{user.id}",
+        limit=settings.email_verification_resend_limit,
+        window_seconds=settings.email_verification_resend_window_seconds,
+    )
+    await verification.send(user)
+    return {"status": "sent"}
 
 
 @router.post("/login", response_model=TokenPair)
@@ -118,7 +147,7 @@ async def oauth_callback(
     client: ClientDep,
 ) -> TokenPair:
     identity = await oauth.exchange_code(provider, code, state)
-    user = await oauth.resolve_user(session, identity)
+    user = await oauth.resolve_user(session, identity, auth.audit)
     auth.audit.record(
         AuditAction.OAUTH_LOGIN,
         actor_id=user.id,

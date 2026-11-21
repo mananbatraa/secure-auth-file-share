@@ -14,6 +14,7 @@ import sys
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import boto3
 import httpx
@@ -30,9 +31,11 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.config import Settings
 from app.core.rbac import Role
+from app.core.security import utcnow
 from app.main import create_app
 from app.models import User
 from app.resources import Resources
+from app.services.mailer import Mail
 from app.services.rate_limit import SlidingWindowLimiter
 from app.services.storage import ObjectStorage
 
@@ -144,9 +147,34 @@ async def redis() -> AsyncIterator[FakeAsyncRedis]:
     await r.aclose()
 
 
+class OutboxMailer:
+    """Collects mail instead of sending it."""
+
+    def __init__(self) -> None:
+        self.sent: list[Mail] = []
+        self.fail = False
+
+    async def send(self, mail: Mail) -> None:
+        if self.fail:
+            raise ConnectionError("SMTP server unreachable")
+        self.sent.append(mail)
+
+    def last_to(self, email: str) -> Mail:
+        return next(m for m in reversed(self.sent) if m.to == email)
+
+
+@pytest.fixture
+def mailer() -> OutboxMailer:
+    return OutboxMailer()
+
+
 @pytest.fixture
 async def resources(
-    settings: Settings, engine: AsyncEngine, redis: FakeAsyncRedis, storage: ObjectStorage
+    settings: Settings,
+    engine: AsyncEngine,
+    redis: FakeAsyncRedis,
+    storage: ObjectStorage,
+    mailer: OutboxMailer,
 ) -> AsyncIterator[Resources]:
     http = httpx.AsyncClient()
     res = Resources(
@@ -157,6 +185,7 @@ async def resources(
         storage=storage,
         http=http,
         limiter=SlidingWindowLimiter(redis, fail_open=settings.rate_limit_fail_open),
+        mailer=mailer,
     )
     yield res
     await http.aclose()
@@ -198,15 +227,23 @@ class UserFactory:
         self.resources = resources
         self._n = 0
 
-    async def __call__(self, email: str | None = None, *, role: Role = Role.MEMBER) -> TestUser:
+    async def __call__(
+        self, email: str | None = None, *, role: Role = Role.MEMBER, verified: bool = True
+    ) -> TestUser:
+        """Register a user. ``verified`` marks the email confirmed, as most tests need."""
         self._n += 1
         email = email or f"user{self._n}@example.com"
         r = await self.client.post("/auth/register", json={"email": email, "password": PASSWORD})
         assert r.status_code == 201, r.text
         user_id = r.json()["id"]
+        values: dict[str, Any] = {}
         if role != Role.MEMBER:
+            values["role"] = role
+        if verified:
+            values["email_verified_at"] = utcnow()
+        if values:
             async with self.resources.sessionmaker() as s:
-                await s.execute(update(User).where(User.email == email).values(role=role))
+                await s.execute(update(User).where(User.email == email).values(**values))
                 await s.commit()
         return await self.login(email, user_id)
 

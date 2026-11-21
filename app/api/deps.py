@@ -8,13 +8,14 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.errors import InvalidToken, NotAuthenticated, PermissionDenied
+from app.core.errors import EmailNotVerified, InvalidToken, NotAuthenticated, PermissionDenied
 from app.core.rbac import Permission, has_permission
 from app.core.security import decode_access_token
 from app.models import User
 from app.resources import Resources
 from app.services.audit import AuditLog
 from app.services.auth import AuthService, ClientInfo
+from app.services.email_verification import EmailVerificationService
 from app.services.files import FileService
 from app.services.oauth import OAuthService
 
@@ -70,6 +71,15 @@ def get_auth_service(session: SessionDep, settings: SettingsDep, audit: AuditLog
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 
 
+def get_email_verification(
+    session: SessionDep, resources: ResourcesDep, audit: AuditLogDep
+) -> EmailVerificationService:
+    return EmailVerificationService(session, resources.settings, resources.mailer, audit)
+
+
+EmailVerificationDep = Annotated[EmailVerificationService, Depends(get_email_verification)]
+
+
 def get_file_service(
     session: SessionDep, resources: ResourcesDep, audit: AuditLogDep
 ) -> FileService:
@@ -103,6 +113,17 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def get_verified_user(user: CurrentUser, settings: SettingsDep) -> User:
+    """The current user, who must have verified their email (when that is required)."""
+    if settings.require_verified_email and not user.email_verified:
+        raise EmailNotVerified()
+    return user
+
+
+# For actions that put content into the system or send it out: uploads and sharing.
+VerifiedUser = Annotated[User, Depends(get_verified_user)]
 
 
 def require_permission(permission: Permission) -> Callable[[User], Awaitable[User]]:

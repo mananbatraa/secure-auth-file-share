@@ -25,9 +25,15 @@ class User(TimestampMixin, Base):
     # Embedded in access tokens; bumping it invalidates every outstanding access token
     # (logout-everywhere, password change, role change, deactivation).
     token_version: Mapped[int] = mapped_column(Integer, default=0)
+    # Set once the owner proves control of the address (link or a verified OAuth email).
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+    @property
+    def email_verified(self) -> bool:
+        return self.email_verified_at is not None
 
 
 class OAuthAccount(TimestampMixin, Base):

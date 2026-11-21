@@ -44,6 +44,25 @@ class Settings(BaseSettings):
 
     password_min_length: int = Field(default=12, ge=8)
 
+    # --- email verification -------------------------------------------------------------
+    # Unverified accounts can sign in and read what is shared with them, but cannot
+    # upload or share until they prove they own the address.
+    require_verified_email: bool = True
+    email_verification_ttl_seconds: int = Field(default=24 * 3600, ge=300)
+    # Where the link in the email points (your frontend, which POSTs the token to
+    # /auth/verify-email). Must contain "{token}".
+    email_verification_url: str = "http://localhost:3000/verify-email?token={token}"
+    email_verification_resend_limit: int = Field(default=3, ge=1)
+    email_verification_resend_window_seconds: int = Field(default=3600, ge=1)
+    # Without SMTP_HOST the email is only logged (development).
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_starttls: bool = True
+    smtp_timeout_seconds: float = 10.0
+    mail_from: str = "Secure File Share <no-reply@localhost>"
+
     # --- object storage (S3 / MinIO) ----------------------------------------------------
     s3_endpoint_url: str | None = None
     # Endpoint used when signing URLs handed to browsers (e.g. http://localhost:9000 when
@@ -89,6 +108,8 @@ class Settings(BaseSettings):
                 raise ValueError("JWT_SECRET must be set in production")
             if len(secret) < 32:
                 raise ValueError("JWT_SECRET must be at least 32 characters")
+        if "{token}" not in self.email_verification_url:
+            raise ValueError("EMAIL_VERIFICATION_URL must contain {token}")
         if self.download_url_default_ttl_seconds > self.download_url_max_ttl_seconds:
             raise ValueError("DOWNLOAD_URL_DEFAULT_TTL_SECONDS exceeds the max TTL")
         return self

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.db.session import create_engine, create_sessionmaker
+from app.services.mailer import Mailer, build_mailer
 from app.services.rate_limit import SlidingWindowLimiter
 from app.services.storage import ObjectStorage
 
@@ -23,6 +24,7 @@ class Resources:
     storage: ObjectStorage
     http: httpx.AsyncClient
     limiter: SlidingWindowLimiter
+    mailer: Mailer
 
     @classmethod
     def build(
@@ -32,6 +34,7 @@ class Resources:
         redis: Redis | None = None,
         http: httpx.AsyncClient | None = None,
         storage: ObjectStorage | None = None,
+        mailer: Mailer | None = None,
     ) -> Resources:
         engine = create_engine(settings)
         redis = redis or Redis.from_url(settings.redis_url, decode_responses=True)
@@ -43,6 +46,7 @@ class Resources:
             storage=storage or ObjectStorage(settings),
             http=http or httpx.AsyncClient(timeout=httpx.Timeout(10.0)),
             limiter=SlidingWindowLimiter(redis, fail_open=settings.rate_limit_fail_open),
+            mailer=mailer or build_mailer(settings),
         )
 
     async def aclose(self) -> None:

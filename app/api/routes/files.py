@@ -6,7 +6,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Query, Request, UploadFile, status
 from fastapi.responses import RedirectResponse, Response
 
-from app.api.deps import ClientDep, CurrentUser, FileServiceDep, ResourcesDep
+from app.api.deps import ClientDep, CurrentUser, FileServiceDep, ResourcesDep, VerifiedUser
 from app.models import AccessLevel, ShareLink
 from app.schemas.files import (
     DirectUploadOut,
@@ -39,7 +39,7 @@ def _grant_out(g: GrantWithEmail) -> GrantOut:
 
 
 @router.post("", response_model=FileOut, status_code=status.HTTP_201_CREATED)
-async def upload_file(upload: UploadFile, user: CurrentUser, files: FileServiceDep) -> FileOut:
+async def upload_file(upload: UploadFile, user: VerifiedUser, files: FileServiceDep) -> FileOut:
     record = await files.upload(
         user, upload.file, filename=upload.filename, content_type=upload.content_type
     )
@@ -48,7 +48,7 @@ async def upload_file(upload: UploadFile, user: CurrentUser, files: FileServiceD
 
 @router.post("/uploads", response_model=DirectUploadOut, status_code=status.HTTP_201_CREATED)
 async def start_direct_upload(
-    body: DirectUploadRequest, request: Request, user: CurrentUser, files: FileServiceDep
+    body: DirectUploadRequest, request: Request, user: VerifiedUser, files: FileServiceDep
 ) -> DirectUploadOut:
     """Get a presigned POST so the client uploads straight to S3, bypassing the API."""
     started = await files.start_direct_upload(
@@ -125,7 +125,7 @@ async def download_url(
 # --- per-user grants -------------------------------------------------------------------
 @router.post("/{file_id}/permissions", response_model=GrantOut, status_code=status.HTTP_201_CREATED)
 async def grant_permission(
-    file_id: uuid.UUID, body: GrantRequest, user: CurrentUser, files: FileServiceDep
+    file_id: uuid.UUID, body: GrantRequest, user: VerifiedUser, files: FileServiceDep
 ) -> GrantOut:
     grant = await files.grant(
         user,
@@ -164,7 +164,7 @@ async def create_share_link(
     file_id: uuid.UUID,
     body: ShareLinkCreate,
     request: Request,
-    user: CurrentUser,
+    user: VerifiedUser,
     files: FileServiceDep,
 ) -> ShareLinkCreated:
     link, token = await files.create_link(

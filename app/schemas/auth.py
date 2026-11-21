@@ -43,7 +43,12 @@ class UserOut(BaseModel):
     email: EmailStr
     role: Role
     is_active: bool
+    email_verified: bool
     created_at: datetime
+
+
+class VerifyEmailRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=2048)
 
 
 class UserAdminUpdate(BaseModel):
