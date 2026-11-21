@@ -68,6 +68,18 @@ services:
       redis: { condition: service_healthy }
       minio: { condition: service_healthy }
 
+  # Sweeps expired upload intents (and their S3 objects), tokens, grants and links.
+  cleanup:
+    build: .
+    command: ["python", "-m", "app.cleanup"]
+    healthcheck: { disable: true }  # the image healthcheck probes the API port
+    environment:
+      <<: *api-env
+      CLEANUP_INTERVAL_SECONDS: ${CLEANUP_INTERVAL_SECONDS:-3600}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      minio: { condition: service_healthy }
+
 volumes:
   pgdata:
   miniodata:

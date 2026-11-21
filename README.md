@@ -12,7 +12,8 @@ A FastAPI backend with production-style authentication and file sharing:
 - **File sharing on S3/MinIO**: uploads are hashed and size-capped, downloads go through **short-lived presigned URLs**, per-file **viewer/editor grants** (optionally expiring), and anonymous **share links** with an expiry and an optional download cap that holds under concurrency.
 - **Direct-to-S3 uploads** for large files: a presigned POST pinned to the key, exact size, content type and SHA-256, followed by a confirm step that re-verifies the stored object and deletes anything that doesn't match.
 - **Append-only audit log** of every security-relevant event (logins with failure reason, throttling, token reuse, admin changes, grants, share-link use), enforced by a Postgres trigger and queryable by admins.
-- Postgres via async SQLAlchemy 2, **Alembic** migrations, Docker Compose stack, CI on GitHub Actions, **180 tests at 98% coverage**, `ruff` + strict `mypy`.
+- **Background cleanup worker** that removes expired upload intents (and the objects they left in S3), expired refresh tokens, grants and dead share links in small `SKIP LOCKED` batches.
+- Postgres via async SQLAlchemy 2, **Alembic** migrations, Docker Compose stack, CI on GitHub Actions, **198 tests at 98% coverage**, `ruff` + strict `mypy`.
 
 ## Architecture
 
@@ -26,6 +27,8 @@ flowchart LR
     API --> R[(Redis<br/>rate limits, OAuth state)]
     API -->|upload / delete| S3
     API -->|code exchange| OP[GitHub / Google OAuth]
+    W[cleanup worker] -->|batched deletes| PG
+    W -->|orphaned objects| S3
 ```
 
 File bytes never stream back through the API. The API authorizes the request, then hands the client a presigned URL that is valid for seconds or minutes. Large uploads can skip the API too (see below).
@@ -36,9 +39,10 @@ app/
   models/     SQLAlchemy models: User, OAuthAccount, RefreshToken, StoredFile, FilePermission,
               ShareLink, UploadIntent, AuditEvent
   services/   auth (rotation), oauth, files (permissions, links, direct uploads), storage (S3),
-              rate_limit (Lua), audit
+              rate_limit (Lua), audit, cleanup (expiry sweeps)
   api/        routes + dependencies (current user, permission checks)
   resources.py  process-wide pools/clients, built in the app lifespan
+  cleanup.py    `python -m app.cleanup` worker entry point
 alembic/      migrations
 tests/        unit + API tests (real Postgres, fakeredis/real Redis, moto S3 server)
 ```
@@ -94,6 +98,19 @@ Every security-relevant action writes an `audit_events` row with the actor, targ
 curl -s "$API/admin/audit?action=auth.login&outcome=failure&since=2026-11-20T10:00:00Z" \
   -H "authorization: Bearer $ADMIN_AT"
 ```
+
+### Background cleanup
+
+`python -m app.cleanup` sweeps expired data; Compose runs it as the `cleanup` service (every `CLEANUP_INTERVAL_SECONDS`, default one hour). Use `--once` for cron or a Kubernetes CronJob (it exits non-zero if the sweep fails) and `--dry-run` to only count.
+
+| What | Removed when |
+|------|--------------|
+| Upload intents + their S3 object | expired more than `CLEANUP_UPLOAD_GRACE_SECONDS` ago (default 1 h, always longer than the 5-minute completion grace) |
+| Refresh tokens | expired more than `CLEANUP_RETENTION_SECONDS` ago (default 7 days) |
+| File grants | past `expires_at` (they already grant nothing) |
+| Share links | expired or revoked more than `CLEANUP_RETENTION_SECONDS` ago |
+
+Each sweep deletes in batches of `CLEANUP_BATCH_SIZE`, one short transaction per batch, selecting rows with `FOR UPDATE SKIP LOCKED`. Several workers can run at once, and a row that a request holds (an upload being confirmed right now) is skipped and picked up next time instead of blocking either side. Intent rows are deleted before their objects: once the row is gone nothing can complete the upload, so the object delete can't race a completion, and a failed object delete only leaves an unreferenced object. A sweep that removed anything writes one `maintenance.cleanup` audit event with the counts.
 
 ## Running it
 
@@ -187,6 +204,7 @@ Errors share one shape: `{"error": {"code": "permission_denied", "message": "...
 - **PKCE on OAuth** even for confidential clients, plus single-use `state` stored in Redis (`GETDEL`) and bound to the provider. Accounts are linked by email only when the provider says that email is verified; otherwise an attacker could take over an existing account.
 - **Verify uploads after the fact.** A presigned POST policy is only as good as the storage backend that enforces it (moto, for one, ignores it). The confirm step checks size, content type and checksum against the stored object, so a client can't swap in different bytes, even against a lax backend.
 - **Audit ids are a Postgres identity, not UUIDs.** `created_at` is the transaction start time, so events inside one transaction tie; a monotonically increasing id gives a total order and a cheap keyset cursor. Retention would be done by a privileged role (or by partitioning by month and dropping old partitions), never by the app's own credentials.
+- **Cleanup keeps dead rows for a while.** Expired refresh tokens stay for the retention period, so for a week a replayed old token is still reported as reuse in the audit log instead of looking like garbage, and owners still see recently expired links. Deleting a rotated token never breaks its successor (`replaced_by_id` is `ON DELETE SET NULL`).
 - **Pinned JWT algorithm and audience/issuer checks.** `alg=none` and algorithm substitution are rejected (there are tests for both).
 
 ## Configuration

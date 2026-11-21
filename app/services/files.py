@@ -34,6 +34,9 @@ from app.services.storage import ObjectStorage, PresignedPost
 log = structlog.get_logger(__name__)
 
 _CHUNK = 1024 * 1024
+# How long after an intent expires it can still be completed (a slow last request).
+# The cleanup job waits longer than this before discarding expired intents.
+UPLOAD_COMPLETE_GRACE = timedelta(minutes=5)
 _CONTENT_TYPE_RE = re.compile(r"^[\w.+-]+/[\w.+-]+$")
 
 
@@ -225,7 +228,7 @@ class FileService:
         key = intent.storage_key
         # The policy expires with the intent, so an object can only arrive before then;
         # allow completing a little later so a slow last request can still be confirmed.
-        if intent.expires_at + timedelta(minutes=5) < utcnow():
+        if intent.expires_at + UPLOAD_COMPLETE_GRACE < utcnow():
             await self._discard_intent(intent, owner, "expired")
             raise Gone("This upload has expired; start a new one")
         info = await self.storage.head(key)

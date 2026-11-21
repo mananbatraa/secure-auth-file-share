@@ -54,7 +54,7 @@ class FilePermission(TimestampMixin, Base):
     granted_by_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
     )
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class ShareLink(TimestampMixin, Base):
@@ -70,7 +70,7 @@ class ShareLink(TimestampMixin, Base):
         ForeignKey("users.id", ondelete="SET NULL")
     )
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     max_downloads: Mapped[int | None] = mapped_column(Integer)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

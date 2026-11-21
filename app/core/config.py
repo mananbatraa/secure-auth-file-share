@@ -63,6 +63,16 @@ class Settings(BaseSettings):
     share_link_redirect_ttl_seconds: int = Field(default=60, ge=10)
     share_link_max_ttl_seconds: int = Field(default=7 * 24 * 3600, ge=60)
 
+    # --- background cleanup (python -m app.cleanup) -----------------------------------
+    cleanup_interval_seconds: int = Field(default=3600, ge=10)
+    cleanup_batch_size: int = Field(default=500, ge=1, le=10_000)
+    # Expired upload intents are discarded this long after expiry. Must exceed the
+    # window in which an expired intent can still be completed (5 minutes).
+    cleanup_upload_grace_seconds: int = Field(default=3600, ge=600)
+    # Expired refresh tokens and dead share links are kept this long (reuse detection,
+    # forensics, owners' link listings) before they are deleted.
+    cleanup_retention_seconds: int = Field(default=7 * 24 * 3600, ge=0)
+
     # --- OAuth --------------------------------------------------------------------------
     oauth_redirect_base_url: str = "http://localhost:8000"
     oauth_state_ttl_seconds: int = 600

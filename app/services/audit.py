@@ -40,6 +40,7 @@ class AuditAction(StrEnum):
     LINK_REVOKED = "file.link_revoked"
     LINK_REDEEMED = "file.link_redeemed"
     LINK_REJECTED = "file.link_rejected"
+    MAINTENANCE_CLEANUP = "maintenance.cleanup"
 
 
 class Outcome(StrEnum):
