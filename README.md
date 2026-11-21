@@ -10,6 +10,7 @@ A FastAPI backend with production-style authentication and file sharing:
 - **Email verification** for password sign-ups: signed, expiring links bound to the address; unverified accounts can sign in and read what is shared with them but can't upload or share. Signing in with OAuth over an unverified squatted account strips its password and sessions (pre-account-takeover defense).
 - **Password reset by email** that doesn't reveal which addresses have accounts, with single-use links bound to the current password and a sign-out everywhere on success.
 - **Browser sessions without exposing the refresh token**: opt in to an HttpOnly, SameSite=Strict refresh cookie, protected by a signed double-submit CSRF token.
+- **Two-factor authentication (TOTP, RFC 6238)** for password and OAuth sign-ins: authenticator-app enrolment, single-use codes (replays and concurrent reuse are refused), hashed one-time recovery codes, per-account guess throttling, seeds encrypted at rest with AES-GCM, and an audited admin reset.
 - **RBAC** (`admin`, `member`, `guest`) mapped to explicit permissions.
 - **Rate-limited login**: Redis sliding-window limits per account and per IP, run atomically in one Lua script.
 - **File sharing on S3/MinIO**: uploads are hashed and size-capped, downloads go through **short-lived presigned URLs**, per-file **viewer/editor grants** (optionally expiring), and anonymous **share links** with an expiry and an optional download cap that holds under concurrency.
@@ -143,6 +144,39 @@ sequenceDiagram
 
 `/auth/refresh` and `/auth/logout` take the token from the JSON body if present (API clients, unchanged) and otherwise from the cookie, in which case the `X-CSRF-Token` header must equal an HMAC of that refresh token under the server key. SameSite=Strict already stops cross-site sends; the CSRF token is the second layer. Because it is derived from the refresh token, it rotates with it, needs no storage, and cannot be forged by someone who can only plant cookies (a sibling subdomain, for example), which a plain double-submit cookie would allow. Reuse detection works exactly as for body tokens. CORS is configured with credentials, so `CORS_ORIGINS` must list explicit origins; `*` is refused at startup, as is `COOKIE_SECURE=false` in production.
 
+### Two-factor authentication (TOTP)
+
+Enrolment is two calls, so a typo in the authenticator app can't lock anyone out:
+
+1. `POST /auth/mfa/totp/setup {"password": ...}` returns a fresh seed (`secret` for manual entry, `otpauth_uri` for a QR code). It needs the password, so a stolen access token can't enrol the thief's phone, and a verified address, so whoever squatted an unverified address can't leave a factor behind for the real owner to inherit.
+2. `POST /auth/mfa/totp/enable {"code": "123456"}` confirms a code from the app, turns 2FA on and returns ten recovery codes, the only time they are shown.
+
+From then on, sign-in (password *or* OAuth) answers with a challenge instead of tokens:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as API
+    participant R as Redis
+    participant DB as Postgres
+    C->>S: POST /auth/login {email, password}
+    S-->>C: {mfa_required: true, mfa_token, expires_in: 300}
+    C->>S: POST /auth/mfa/verify {mfa_token, code}
+    S->>DB: SELECT user FOR UPDATE (token_version still matches?)
+    S->>R: per-account attempt counter (5 per 5 min)
+    S->>S: code valid for step t-1, t or t+1, and step > last accepted?
+    S->>R: SET mfa-challenge-used:{jti} NX
+    S->>DB: store last accepted step, audit auth.login {mfa: totp}, COMMIT
+    S-->>C: token pair (X-Token-Delivery: cookie works here too)
+```
+
+- **Every code works once.** The last accepted 30-second step is stored and checked under the row lock, so a code (or an older one still inside the drift window) is refused after use, and five concurrent requests with one code let exactly one through (there is a test).
+- **The challenge token is not a credential.** It is a 5-minute JWT with its own audience, so it is never accepted as an access token. It is single use, carries `token_version` so "log out everywhere" or a password reset kills it, and a wrong code leaves it usable for another try.
+- **Guessing is throttled per account** (`MFA_MAX_ATTEMPTS` per `MFA_WINDOW_SECONDS`), across login, enable, disable and recovery-code regeneration, and Redis being down fails closed (`503`). Five guesses per five minutes against three valid codes is about 1 in 66,000 per window.
+- **Recovery codes** (`abcde-fghjk`, ~50 bits, no look-alike characters) are stored as HMACs bound to the user and consumed by one conditional `UPDATE`, so each works once. Input is normalised (case, spaces, dashes). `POST /auth/mfa/recovery-codes` with a TOTP code replaces them all.
+- **Seeds are encrypted at rest** with AES-256-GCM under `MFA_ENCRYPTION_KEY` (or a key derived from `JWT_SECRET` if unset), with the user id as associated data, so a database dump alone yields no seeds and a ciphertext moved to another row fails to decrypt (and fails closed).
+- **Turning it off** (`POST /auth/mfa/disable`) needs the password and a TOTP or recovery code. An admin can `POST /admin/users/{id}/mfa/reset` for someone who lost both, which also ends that user's sessions. Every step is in the audit log (`auth.mfa_*`, `admin.mfa_reset`).
+
 ### Background cleanup
 
 `python -m app.cleanup` sweeps expired data; Compose runs it as the `cleanup` service (every `CLEANUP_INTERVAL_SECONDS`, default one hour). Use `--once` for cron or a Kubernetes CronJob (it exits non-zero if the sweep fails) and `--dry-run` to only count.
@@ -204,7 +238,7 @@ uv run uvicorn app.main:app_factory --factory --reload
 ```bash
 docker compose up -d postgres redis
 createdb -h localhost -U postgres fileshare_test   # once
-uv run pytest --cov=app        # 227 tests
+uv run pytest --cov=app        # 333 tests
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
@@ -217,7 +251,7 @@ The test suite runs migrations from scratch, then exercises the API against real
 | POST | `/auth/register` | anyone | password ≥ 12 chars, not containing the email name |
 | POST | `/auth/verify-email` | anyone with the link | `{"token": ...}`; idempotent; `400 invalid_verification_token` if expired, forged or for an old address |
 | POST | `/auth/verify-email/resend` | unverified user | `202`; `409` if already verified; `429` past the hourly cap |
-| POST | `/auth/login` | anyone | rate limited per account and per IP; `429` + `Retry-After`; `X-Token-Delivery: cookie` for browser sessions |
+| POST | `/auth/login` | anyone | rate limited per account and per IP; `429` + `Retry-After`; `X-Token-Delivery: cookie` for browser sessions; with 2FA on, returns `{mfa_required, mfa_token}` instead of tokens |
 | POST | `/auth/password-reset/request` | anyone | `{"email": ...}`; always `202`; `429` past the per-address or per-IP cap |
 | POST | `/auth/password-reset/confirm` | anyone with the link | `{"token", "new_password"}`; `204`, signs out everywhere; `400 invalid_reset_token` if used, expired or stale |
 | POST | `/auth/refresh` | refresh token (body, or cookie + `X-CSRF-Token`) | rotates; replay → `401 refresh_token_reused`; bad CSRF → `403 csrf_failed` |
@@ -225,7 +259,14 @@ The test suite runs migrations from scratch, then exercises the API against real
 | POST | `/auth/logout-all` | user | revokes all sessions and live access tokens |
 | POST | `/auth/change-password` | user | also logs out everywhere |
 | GET | `/auth/oauth/{github,google}/authorize` | anyone | 302 to provider |
-| GET | `/auth/oauth/{provider}/callback` | provider | returns a token pair |
+| GET | `/auth/oauth/{provider}/callback` | provider | returns a token pair, or an MFA challenge |
+| GET | `/auth/mfa` | user | `{enabled, pending, recovery_codes_remaining}` |
+| POST | `/auth/mfa/totp/setup` | verified user | `{"password"}` (omit for OAuth-only accounts); returns `secret` + `otpauth_uri`; `409` if already on |
+| POST | `/auth/mfa/totp/enable` | user | `{"code"}`; returns 10 recovery codes once |
+| POST | `/auth/mfa/verify` | anyone with a challenge | `{"mfa_token", "code" \| "recovery_code"}`; returns a token pair; `401 invalid_mfa_code` / `invalid_mfa_token`; `429` past the per-account cap |
+| POST | `/auth/mfa/recovery-codes` | user with 2FA | `{"code"}`; replaces all recovery codes |
+| POST | `/auth/mfa/disable` | user with 2FA | `{"password", "code" \| "recovery_code"}` |
+| POST | `/admin/users/{id}/mfa/reset` | admin | removes the factor and ends the user's sessions |
 | GET | `/users/me` | user | |
 | GET/PATCH | `/admin/users[/{id}]` | admin | change role / deactivate (takes effect immediately) |
 | POST/GET | `/files` | member+ / user | multipart upload (`upload` field); list `?scope=owned\|shared\|all` |
@@ -259,6 +300,8 @@ Errors share one shape: `{"error": {"code": "permission_denied", "message": "...
 - **Cleanup keeps dead rows for a while.** Expired refresh tokens stay for the retention period, so for a week a replayed old token is still reported as reuse in the audit log instead of looking like garbage, and owners still see recently expired links. Deleting a rotated token never breaks its successor (`replaced_by_id` is `ON DELETE SET NULL`).
 - **Reset tokens are bound to the password, not stored.** A table of used tokens would work, but binding the token to an HMAC of the password hash gives single use, "a newer reset wins" and "a password change revokes pending resets" for free. The HMAC (rather than a plain digest) keeps the readable JWT from carrying anything derived from the stored hash that could be checked offline.
 - **Cookie delivery is opt-in per login.** API and mobile clients keep the simple JSON contract; browsers get the HttpOnly cookie. Mixing is safe because a body token always wins and never needs CSRF (a cross-site page can't read or send it).
+- **TOTP over SMS or email codes.** It needs no delivery channel (nothing to intercept or SIM-swap, no provider bill) and works offline. It is implemented on `hmac` in ~40 lines and checked against the RFC 4226 and RFC 6238 test vectors rather than pulled in as a dependency. WebAuthn/passkeys would be the stronger next step against phishing.
+- **The second factor applies to OAuth too.** A provider vouches for the first factor only; skipping TOTP there would make "Sign in with GitHub" a 2FA bypass for anyone who controls the linked GitHub account.
 - **Pinned JWT algorithm and audience/issuer checks.** `alg=none` and algorithm substitution are rejected (there are tests for both).
 
 ## Configuration

@@ -37,18 +37,33 @@ Handoff notes between build runs. Slot: Nov 20-21 2026 (runs at 10:40 AM, 4:40 P
 - **Browser sessions** (`app/api/session_cookies.py`): `X-Token-Delivery: cookie` on login puts the refresh token in an HttpOnly, Secure, SameSite=Strict cookie on `/auth` (body gets `refresh_token: null` plus `csrf_token`). `/auth/refresh` and `/auth/logout` fall back to the cookie and then require `X-CSRF-Token` = HMAC(key, refresh token) (signed double submit); body tokens win and need no CSRF. Logout clears cookies. CORS now allows credentials and the new headers; settings refuse `CORS_ORIGINS=["*"]` and `COOKIE_SECURE=false` in production.
 - README: feature bullets, password reset and browser session sections (with a sequence diagram), API rows, two design decisions. `.env.example` has the new settings.
 
+## Done (Nov 21, afternoon run)
+
+- CI was green for the morning run's push.
+- **TOTP two-factor auth** (`app/core/totp.py`, `app/services/mfa.py`, `app/api/routes/mfa.py`, migration 0006: `users.totp_secret/totp_enabled_at/totp_last_step`, `mfa_recovery_codes`). RFC 6238 on `hmac`, tested against the RFC 4226/6238 vectors, ±1 step drift.
+  - Enrolment: `POST /auth/mfa/totp/setup` (needs password unless OAuth-only, and a verified email) then `/totp/enable` with a code, which returns 10 recovery codes. `GET /auth/mfa` for status.
+  - Sign-in: login and the OAuth callback return `{mfa_required, mfa_token}` when 2FA is on; `POST /auth/mfa/verify` with a TOTP or recovery code returns tokens (cookie delivery supported). Challenge token: 5-minute JWT, own audience, single use (Redis `SET NX` on jti), bound to `token_version`.
+  - Replay safety: last accepted step stored under a row lock (5 concurrent verifies with one code: exactly one wins); recovery codes consumed by one conditional UPDATE; codes stored as per-user HMACs.
+  - Per-account throttle on every code check (`MFA_MAX_ATTEMPTS`/`MFA_WINDOW_SECONDS`), fails closed on Redis outage.
+  - Seeds AES-256-GCM encrypted with the user id as AAD (`MFA_ENCRYPTION_KEY`, else derived from `JWT_SECRET` via HKDF).
+  - `POST /auth/mfa/disable` (password + code), `POST /auth/mfa/recovery-codes` (regenerate, needs TOTP), `POST /admin/users/{id}/mfa/reset` (also ends sessions). OAuth pre-account-takeover path also clears any factor.
+  - Audit actions `auth.mfa_setup_started/enabled/disabled/challenge_issued/failed/recovery_codes_regenerated`, `admin.mfa_reset`; logins record `{mfa: totp|recovery_code}`.
+- `UserOut` now has `mfa_enabled`. `AuthService.login` was split into `authenticate` + `complete_login`.
+- README: feature bullet, 2FA section with a sequence diagram, API rows, two design decisions; `.env.example` has the MFA settings.
+
 ## Test status
 
-- 267 passed, 0 failed (`uv run pytest`), 98% line+branch coverage (new modules 100%).
+- 334 passed, 0 failed (`uv run pytest`), 99% line+branch coverage (67 new 2FA tests).
 - `ruff check`, `ruff format --check`, `mypy --strict` (app + tests) all clean.
 - Docker image not built in the sandbox (package downloads are blocked there); CI builds it.
 
 ## Next steps (ideas for the remaining runs)
 
 1. Check CI is green for this run's push.
-2. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README (dockerd works in the sandbox; k6 via the grafana/k6 image).
-3. OAuth callback could also offer cookie delivery (it is a browser redirect, so it would need to redirect to the frontend instead of returning JSON).
-4. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
+2. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
+3. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README (dockerd works in the sandbox; k6 via the grafana/k6 image).
+4. OAuth callback could also offer cookie delivery and the 2FA challenge via a frontend redirect (it is a browser redirect, so it should hand off a one-time code instead of returning JSON).
+5. WebAuthn/passkeys as a phishing-resistant second factor.
 
 ## Local test setup used in the sandbox
 
