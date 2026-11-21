@@ -1,6 +1,6 @@
 # Progress
 
-Handoff notes between build runs. Slot: Nov 20-21 2026 (four runs; the Nov 20 morning run was lost waiting for the repo, so work started ~11:30 AM Phoenix).
+Handoff notes between build runs. Slot: Nov 20-21 2026 (runs at 10:40 AM, 4:40 PM, 10:40 PM Phoenix; the Nov 20 morning run was lost waiting for the repo, so work started ~11:30 AM Phoenix).
 
 ## Done (Nov 20, first working run)
 
@@ -21,20 +21,28 @@ Handoff notes between build runs. Slot: Nov 20-21 2026 (four runs; the Nov 20 mo
 - Fixed a test leak: the lifespan test now truncates the rows it creates.
 - README: new feature bullets, upload sequence diagram, audit section, API table rows, two new design decisions. `.env.example` has the new settings.
 
+## Done (Nov 20, late run)
+
+- CI was green for the evening run's push.
+- **Cleanup worker** (`python -m app.cleanup`, `--once`, `--dry-run`, compose `cleanup` service): removes expired upload intents and their S3 objects (after a 1 h grace, longer than the 5-minute completion grace), refresh tokens and dead share links after a 7-day retention, and expired grants. Batches with `FOR UPDATE SKIP LOCKED`, rows before objects, one `maintenance.cleanup` audit event per productive sweep. Migration 0004 indexes `expires_at`.
+- **Email verification**: `users.email_verified_at` (migration 0005, backfills OAuth-linked accounts). Stateless JWT link token (own audience, 24 h, bound to a fingerprint of the address). `POST /auth/verify-email`, `POST /auth/verify-email/resend` (capped 3/h per account). Unverified users get `403 email_not_verified` on uploads, grants and share links (`REQUIRE_VERIFIED_EMAIL`). Mailer abstraction: SMTP, or a logging mailer that redacts bodies in production; Mailpit in compose. Registration never fails on a mail outage.
+- **Pre-account-takeover defense**: OAuth linking to an unverified password account removes the password and revokes its sessions and access tokens (audited).
+- Test fixture `make_user` now marks users verified by default (`verified=False` for the new tests); audit tests count the new `auth.email_verification_sent` event.
+- README: features, diagram, verification and cleanup sections, API rows, design decisions.
+
 ## Test status
 
-- 180 passed, 0 failed (`uv run pytest`), 98% line+branch coverage.
+- 227 passed, 0 failed (`uv run pytest`), 98% line+branch coverage.
 - `ruff check`, `ruff format --check`, `mypy --strict` (app + tests) all clean.
 - Docker image not built in the sandbox (package downloads are blocked there); CI builds it.
 
 ## Next steps (ideas for the remaining runs)
 
 1. Check CI is green for this run's push.
-2. Background cleanup (e.g. `python -m app.cleanup`, run by a compose service or cron): delete expired upload intents and their S3 objects, expired refresh tokens, grants and links.
-3. Optional refresh token in an HttpOnly, SameSite=strict cookie for browser clients (with CSRF protection on `/auth/refresh`).
-4. Email verification for password sign-ups (token table + endpoint; mock mailer in tests).
-5. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README.
-6. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
+2. Optional refresh token in an HttpOnly, SameSite=strict cookie for browser clients (with CSRF protection on `/auth/refresh`).
+3. Password reset by email (reuse the mailer and the signed-token pattern; bind the token to the current password hash so it is single-use).
+4. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README.
+5. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
 
 ## Local test setup used in the sandbox
 

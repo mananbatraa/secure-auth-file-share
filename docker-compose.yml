@@ -17,6 +17,11 @@ x-api-env: &api-env
   GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
   GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
   GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  # Verification emails land in Mailpit (http://localhost:8025) locally.
+  SMTP_HOST: mailpit
+  SMTP_PORT: "1025"
+  SMTP_STARTTLS: "false"
+  MAIL_FROM: Secure File Share <no-reply@localhost>
 
 services:
   postgres:
@@ -52,6 +57,10 @@ services:
       interval: 5s
       retries: 10
 
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports: ["8025:8025", "1025:1025"]
+
   migrate:
     build: .
     command: ["alembic", "upgrade", "head"]
@@ -67,6 +76,7 @@ services:
       migrate: { condition: service_completed_successfully }
       redis: { condition: service_healthy }
       minio: { condition: service_healthy }
+      mailpit: { condition: service_started }
 
   # Sweeps expired upload intents (and their S3 objects), tokens, grants and links.
   cleanup:
