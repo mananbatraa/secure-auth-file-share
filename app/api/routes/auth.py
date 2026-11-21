@@ -11,6 +11,7 @@ from app.api.deps import (
     ClientDep,
     CurrentUser,
     EmailVerificationDep,
+    MfaServiceDep,
     OAuthServiceDep,
     PasswordResetDep,
     ResourcesDep,
@@ -21,6 +22,7 @@ from app.core.security import hash_opaque_token
 from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
+    MfaChallenge,
     PasswordResetConfirm,
     PasswordResetRequest,
     RefreshRequest,
@@ -31,6 +33,7 @@ from app.schemas.auth import (
 )
 from app.services.audit import AuditAction, Outcome
 from app.services.auth import IssuedTokens, normalize_email
+from app.services.mfa import Challenge
 from app.services.password_reset import deliver_quietly
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -43,6 +46,10 @@ def _pair(tokens: IssuedTokens) -> TokenPair:
         expires_in=tokens.access_expires_in,
         refresh_expires_in=tokens.refresh_expires_in,
     )
+
+
+def _challenge(challenge: Challenge) -> MfaChallenge:
+    return MfaChallenge(mfa_token=challenge.token, expires_in=challenge.expires_in)
 
 
 @router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -114,16 +121,21 @@ async def confirm_password_reset(body: PasswordResetConfirm, reset: PasswordRese
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.post("/login", response_model=TokenPair)
+@router.post("/login", response_model=TokenPair | MfaChallenge)
 async def login(
     body: LoginRequest,
     auth: AuthServiceDep,
+    mfa: MfaServiceDep,
     client: ClientDep,
     resources: ResourcesDep,
     request: Request,
     response: Response,
-) -> TokenPair:
-    """Sign in. Send ``X-Token-Delivery: cookie`` to get the refresh token as a cookie."""
+) -> TokenPair | MfaChallenge:
+    """Sign in. Send ``X-Token-Delivery: cookie`` to get the refresh token as a cookie.
+
+    With two-factor auth on, the answer is an :class:`MfaChallenge` instead of tokens:
+    finish at ``POST /auth/mfa/verify``.
+    """
     settings = resources.settings
     limiter = resources.limiter
     # Two buckets: per source IP (spraying many accounts) and per account (targeted
@@ -147,8 +159,11 @@ async def login(
             email=normalize_email(body.email),
         )
         raise
-    tokens = await auth.login(body.email, body.password, client)
+    user = await auth.authenticate(body.email, body.password)
     await limiter.reset(email_key)
+    if user.mfa_enabled:
+        return _challenge(await mfa.issue_challenge(user, method="password"))
+    tokens = await auth.complete_login(user, client)
     return session_cookies.deliver(
         tokens, response, settings, cookie=session_cookies.wants_cookie(request)
     )
@@ -213,7 +228,7 @@ async def oauth_authorize(provider: str, oauth: OAuthServiceDep) -> RedirectResp
     return RedirectResponse(url, status_code=status.HTTP_302_FOUND)
 
 
-@router.get("/oauth/{provider}/callback", response_model=TokenPair)
+@router.get("/oauth/{provider}/callback", response_model=TokenPair | MfaChallenge)
 async def oauth_callback(
     provider: str,
     code: Annotated[str, Query(min_length=1, max_length=2048)],
@@ -221,16 +236,15 @@ async def oauth_callback(
     oauth: OAuthServiceDep,
     session: SessionDep,
     auth: AuthServiceDep,
+    mfa: MfaServiceDep,
     client: ClientDep,
-) -> TokenPair:
+) -> TokenPair | MfaChallenge:
     identity = await oauth.exchange_code(provider, code, state)
     user = await oauth.resolve_user(session, identity, auth.audit)
-    auth.audit.record(
-        AuditAction.OAUTH_LOGIN,
-        actor_id=user.id,
-        target_type="user",
-        target_id=user.id,
-        provider=identity.provider,
+    if user.mfa_enabled:
+        # The provider vouches for the first factor only; the TOTP still applies.
+        return _challenge(await mfa.issue_challenge(user, method=f"oauth:{identity.provider}"))
+    tokens = await auth.complete_login(
+        user, client, action=AuditAction.OAUTH_LOGIN, details={"provider": identity.provider}
     )
-    tokens, _ = await auth.issue_tokens(user, client)
     return _pair(tokens)

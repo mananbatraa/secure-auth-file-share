@@ -14,7 +14,12 @@ import jwt
 from pwdlib import PasswordHash
 
 from app.core.config import Settings
-from app.core.errors import InvalidResetToken, InvalidToken, InvalidVerificationToken
+from app.core.errors import (
+    InvalidMfaToken,
+    InvalidResetToken,
+    InvalidToken,
+    InvalidVerificationToken,
+)
 
 _password_hash = PasswordHash.recommended()  # Argon2id
 # Verified against when the user does not exist, so login timing doesn't leak which
@@ -201,6 +206,78 @@ def decode_password_reset_token(settings: Settings, token: str) -> PasswordReset
         )
     except (jwt.PyJWTError, ValueError, TypeError) as exc:
         raise InvalidResetToken() from exc
+
+
+def _mfa_audience(settings: Settings) -> str:
+    return f"{settings.jwt_audience}:mfa"
+
+
+@dataclass(frozen=True, slots=True)
+class MfaChallengeClaims:
+    user_id: uuid.UUID
+    token_version: int
+    jti: str
+    # How the first factor was satisfied: "password" or "oauth:<provider>".
+    method: str
+    expires_at: datetime
+
+
+def create_mfa_challenge_token(
+    settings: Settings, *, user_id: uuid.UUID, token_version: int, method: str
+) -> tuple[str, MfaChallengeClaims]:
+    """Proof that the first factor passed, redeemable once for tokens plus a TOTP code.
+
+    It grants nothing on its own (its own audience, so it can never act as an access
+    token), lives for minutes, and carries ``token_version`` so logout-everywhere or a
+    password reset in the meantime kills it.
+    """
+    now = utcnow()
+    claims = MfaChallengeClaims(
+        user_id=user_id,
+        token_version=token_version,
+        jti=uuid.uuid4().hex,
+        method=method,
+        expires_at=now + timedelta(seconds=settings.mfa_challenge_ttl_seconds),
+    )
+    payload: dict[str, Any] = {
+        "sub": str(user_id),
+        "ver": token_version,
+        "mth": method,
+        "type": "mfa_challenge",
+        "iss": settings.jwt_issuer,
+        "aud": _mfa_audience(settings),
+        "iat": now,
+        "exp": claims.expires_at,
+        "jti": claims.jti,
+    }
+    token = jwt.encode(
+        payload, settings.jwt_secret.get_secret_value(), algorithm=settings.jwt_algorithm
+    )
+    return token, claims
+
+
+def decode_mfa_challenge_token(settings: Settings, token: str) -> MfaChallengeClaims:
+    """Check signature, audience and expiry; raises :class:`InvalidMfaToken`."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret.get_secret_value(),
+            algorithms=[settings.jwt_algorithm],
+            audience=_mfa_audience(settings),
+            issuer=settings.jwt_issuer,
+            options={"require": ["sub", "exp", "iat", "type", "ver", "jti", "mth"]},
+        )
+        if payload.get("type") != "mfa_challenge":
+            raise InvalidMfaToken()
+        return MfaChallengeClaims(
+            user_id=uuid.UUID(payload["sub"]),
+            token_version=int(payload["ver"]),
+            jti=str(payload["jti"]),
+            method=str(payload["mth"]),
+            expires_at=datetime.fromtimestamp(payload["exp"], tz=UTC),
+        )
+    except (jwt.PyJWTError, ValueError, TypeError) as exc:
+        raise InvalidMfaToken() from exc
 
 
 def decode_access_token(settings: Settings, token: str) -> AccessClaims:

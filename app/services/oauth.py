@@ -26,6 +26,7 @@ from app.core.security import new_opaque_token, utcnow
 from app.models import OAuthAccount, RefreshToken, User
 from app.services.audit import AuditAction, AuditLog
 from app.services.auth import normalize_email
+from app.services.mfa import clear_mfa
 
 log = structlog.get_logger(__name__)
 
@@ -220,6 +221,9 @@ class OAuthService:
                     .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
                     .values(revoked_at=utcnow())
                 )
+                # Enrolment needs a verified address, so this is belt and braces: no
+                # factor the pre-registrant set up may survive the takeover.
+                await clear_mfa(session, user)
                 audit.record(
                     AuditAction.UNVERIFIED_PASSWORD_REMOVED,
                     actor_id=user.id,

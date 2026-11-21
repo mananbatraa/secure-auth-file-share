@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEV_JWT_SECRET = "dev-only-insecure-secret-change-me-0123456789"  # noqa: S105
@@ -53,6 +55,20 @@ class Settings(BaseSettings):
     cookie_domain: str | None = None
 
     password_min_length: int = Field(default=12, ge=8)
+
+    # --- two-factor authentication (TOTP) ------------------------------------------------
+    # Shown as the account name's prefix in authenticator apps.
+    mfa_issuer: str = "Secure File Share"
+    # Lifetime of the token that links a password (or OAuth) step to the TOTP step.
+    mfa_challenge_ttl_seconds: int = Field(default=300, ge=30, le=1800)
+    # Second-factor guesses per account, across login, enable, disable and regenerate.
+    mfa_max_attempts: int = Field(default=5, ge=1)
+    mfa_window_seconds: int = Field(default=300, ge=1)
+    mfa_recovery_code_count: int = Field(default=10, ge=4, le=20)
+    # 32 random bytes, base64url-encoded (see .env.example for a one-liner).
+    # Encrypts TOTP seeds at rest. If unset, a key is derived from JWT_SECRET, which then
+    # can't be rotated without re-enrolling everyone; set it in production.
+    mfa_encryption_key: SecretStr | None = None
 
     # --- email verification -------------------------------------------------------------
     # Unverified accounts can sign in and read what is shared with them, but cannot
@@ -119,6 +135,12 @@ class Settings(BaseSettings):
     google_client_id: str | None = None
     google_client_secret: SecretStr | None = None
 
+    @field_validator("mfa_encryption_key", mode="before")
+    @classmethod
+    def _empty_key_is_unset(cls, value: object) -> object:
+        # "MFA_ENCRYPTION_KEY=" (as in .env.example) means "not set".
+        return None if value == "" else value
+
     @model_validator(mode="after")
     def _check_production_safety(self) -> Settings:
         secret = self.jwt_secret.get_secret_value()
@@ -136,6 +158,13 @@ class Settings(BaseSettings):
             raise ValueError("CORS_ORIGINS must list explicit origins, not *")
         if self.environment == "production" and not self.cookie_secure:
             raise ValueError("COOKIE_SECURE must be true in production")
+        if self.mfa_encryption_key is not None:
+            try:
+                raw = base64.urlsafe_b64decode(self.mfa_encryption_key.get_secret_value())
+            except (ValueError, binascii.Error) as exc:
+                raise ValueError("MFA_ENCRYPTION_KEY must be base64url") from exc
+            if len(raw) != 32:
+                raise ValueError("MFA_ENCRYPTION_KEY must decode to 32 bytes")
         if self.download_url_default_ttl_seconds > self.download_url_max_ttl_seconds:
             raise ValueError("DOWNLOAD_URL_DEFAULT_TTL_SECONDS exceeds the max TTL")
         return self

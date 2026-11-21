@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import select, update
@@ -171,13 +172,20 @@ class AuthService:
         )
         return tokens, row
 
-    async def login(self, email: str, password: str, client: ClientInfo) -> IssuedTokens:
-        user = await self.authenticate(email, password)
+    async def complete_login(
+        self,
+        user: User,
+        client: ClientInfo,
+        *,
+        action: AuditAction = AuditAction.LOGIN,
+        details: dict[str, Any] | None = None,
+    ) -> IssuedTokens:
+        """Record the sign-in and open a session (commits)."""
         self.audit.record(
-            AuditAction.LOGIN, actor_id=user.id, target_type="user", target_id=user.id
+            action, actor_id=user.id, target_type="user", target_id=user.id, **(details or {})
         )
         tokens, _ = await self.issue_tokens(user, client)
-        log.info("login_succeeded", user_id=str(user.id))
+        log.info("login_succeeded", user_id=str(user.id), **(details or {}))
         return tokens
 
     async def rotate(self, raw_refresh: str, client: ClientInfo) -> IssuedTokens:

@@ -52,6 +52,7 @@ TABLES = ", ".join(
         "file_permissions",
         "files",
         "refresh_tokens",
+        "mfa_recovery_codes",
         "oauth_accounts",
         "users",
     ]

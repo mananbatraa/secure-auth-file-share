@@ -3,10 +3,17 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, status
+from fastapi.responses import Response
 from sqlalchemy import select
 
-from app.api.deps import AuthServiceDep, CurrentUser, SessionDep, require_permission
+from app.api.deps import (
+    AuthServiceDep,
+    CurrentUser,
+    MfaServiceDep,
+    SessionDep,
+    require_permission,
+)
 from app.core.errors import Conflict, NotFound
 from app.core.rbac import Permission
 from app.models import User
@@ -70,3 +77,21 @@ async def update_user(
     await session.commit()
     await session.refresh(target)
     return UserOut.model_validate(target)
+
+
+@router.post("/admin/users/{user_id}/mfa/reset", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_user_mfa(
+    user_id: uuid.UUID,
+    session: SessionDep,
+    mfa: MfaServiceDep,
+    admin: Annotated[User, Depends(require_permission(Permission.USERS_MANAGE))],
+) -> Response:
+    """Remove a user's second factor (lost device and codes) and end their sessions.
+
+    Check the person's identity out of band first: this is an account-recovery bypass.
+    """
+    target = await session.get(User, user_id)
+    if target is None:
+        raise NotFound("User not found")
+    await mfa.admin_reset(admin, target)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

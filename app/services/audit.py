@@ -33,7 +33,14 @@ class AuditAction(StrEnum):
     PASSWORD_CHANGED = "auth.password_changed"  # noqa: S105 - an event name
     PASSWORD_RESET_REQUESTED = "auth.password_reset_requested"  # noqa: S105
     PASSWORD_RESET = "auth.password_reset"  # noqa: S105
+    MFA_SETUP_STARTED = "auth.mfa_setup_started"
+    MFA_ENABLED = "auth.mfa_enabled"
+    MFA_DISABLED = "auth.mfa_disabled"
+    MFA_CHALLENGE = "auth.mfa_challenge_issued"
+    MFA_FAILED = "auth.mfa_failed"
+    MFA_RECOVERY_CODES_REGENERATED = "auth.mfa_recovery_codes_regenerated"
     USER_UPDATED = "admin.user_updated"
+    MFA_RESET = "admin.mfa_reset"
     FILE_UPLOADED = "file.uploaded"
     FILE_UPLOAD_REJECTED = "file.upload_rejected"
     FILE_RENAMED = "file.renamed"

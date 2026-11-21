@@ -42,6 +42,20 @@ class TokenReuseDetected(InvalidToken):
         super().__init__("Refresh token reuse detected; all sessions in this family were revoked")
 
 
+class InvalidMfaToken(InvalidToken):
+    code = "invalid_mfa_token"
+
+    def __init__(self) -> None:
+        super().__init__("Invalid, used or expired sign-in challenge; sign in again")
+
+
+class InvalidMfaCode(NotAuthenticated):
+    code = "invalid_mfa_code"
+
+    def __init__(self) -> None:
+        super().__init__("Invalid or already used authentication code")
+
+
 class PermissionDenied(AppError):
     status_code = 403
     code = "permission_denied"
@@ -60,8 +74,10 @@ class CsrfFailed(PermissionDenied):
 class EmailNotVerified(PermissionDenied):
     code = "email_not_verified"
 
-    def __init__(self) -> None:
-        super().__init__("Verify your email address before uploading or sharing files")
+    def __init__(
+        self, message: str = "Verify your email address before uploading or sharing files"
+    ) -> None:
+        super().__init__(message)
 
 
 class InvalidVerificationToken(AppError):

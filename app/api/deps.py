@@ -17,6 +17,7 @@ from app.services.audit import AuditLog
 from app.services.auth import AuthService, ClientInfo
 from app.services.email_verification import EmailVerificationService
 from app.services.files import FileService
+from app.services.mfa import MfaService
 from app.services.oauth import OAuthService
 from app.services.password_reset import PasswordResetService
 
@@ -86,6 +87,13 @@ def get_password_reset(auth: AuthServiceDep, settings: SettingsDep) -> PasswordR
 
 
 PasswordResetDep = Annotated[PasswordResetService, Depends(get_password_reset)]
+
+
+def get_mfa_service(session: SessionDep, resources: ResourcesDep, audit: AuditLogDep) -> MfaService:
+    return MfaService(session, resources.settings, resources.redis, resources.limiter, audit)
+
+
+MfaServiceDep = Annotated[MfaService, Depends(get_mfa_service)]
 
 
 def get_file_service(
