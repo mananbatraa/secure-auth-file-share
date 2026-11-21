@@ -30,19 +30,25 @@ Handoff notes between build runs. Slot: Nov 20-21 2026 (runs at 10:40 AM, 4:40 P
 - Test fixture `make_user` now marks users verified by default (`verified=False` for the new tests); audit tests count the new `auth.email_verification_sent` event.
 - README: features, diagram, verification and cleanup sections, API rows, design decisions.
 
+## Done (Nov 21, morning run)
+
+- CI was green for the late run's push.
+- **Password reset** (`POST /auth/password-reset/request`, `/confirm`; `app/services/password_reset.py`): always `202` with an identical body, mail sent as a background task after the response, throttled per IP and per hashed address (known or not). Token: 30-minute JWT, own audience, bound to user, address fingerprint and an HMAC of the current password hash, so it is single-use with no table, a newer reset kills older links, and change-password kills pending links. Confirm takes a row lock (concurrent confirms: exactly one wins), revokes all sessions/access tokens, verifies the address, works for OAuth-only accounts. Audited (`auth.password_reset_requested`, `auth.password_reset`, with failure reasons).
+- **Browser sessions** (`app/api/session_cookies.py`): `X-Token-Delivery: cookie` on login puts the refresh token in an HttpOnly, Secure, SameSite=Strict cookie on `/auth` (body gets `refresh_token: null` plus `csrf_token`). `/auth/refresh` and `/auth/logout` fall back to the cookie and then require `X-CSRF-Token` = HMAC(key, refresh token) (signed double submit); body tokens win and need no CSRF. Logout clears cookies. CORS now allows credentials and the new headers; settings refuse `CORS_ORIGINS=["*"]` and `COOKIE_SECURE=false` in production.
+- README: feature bullets, password reset and browser session sections (with a sequence diagram), API rows, two design decisions. `.env.example` has the new settings.
+
 ## Test status
 
-- 227 passed, 0 failed (`uv run pytest`), 98% line+branch coverage.
+- 267 passed, 0 failed (`uv run pytest`), 98% line+branch coverage (new modules 100%).
 - `ruff check`, `ruff format --check`, `mypy --strict` (app + tests) all clean.
 - Docker image not built in the sandbox (package downloads are blocked there); CI builds it.
 
 ## Next steps (ideas for the remaining runs)
 
 1. Check CI is green for this run's push.
-2. Optional refresh token in an HttpOnly, SameSite=strict cookie for browser clients (with CSRF protection on `/auth/refresh`).
-3. Password reset by email (reuse the mailer and the signed-token pattern; bind the token to the current password hash so it is single-use).
-4. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README.
-5. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
+2. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README (dockerd works in the sandbox; k6 via the grafana/k6 image).
+3. OAuth callback could also offer cookie delivery (it is a browser redirect, so it would need to redirect to the frontend instead of returning JSON).
+4. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
 
 ## Local test setup used in the sandbox
 

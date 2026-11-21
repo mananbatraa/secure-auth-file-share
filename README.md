@@ -8,6 +8,8 @@ A FastAPI backend with production-style authentication and file sharing:
 - **Instant revocation**: "log out everywhere", password changes, role changes and deactivation invalidate outstanding access tokens immediately, without a token blocklist.
 - **OAuth login** with GitHub and Google (authorization code + `state` + PKCE), linking accounts by *verified* email only.
 - **Email verification** for password sign-ups: signed, expiring links bound to the address; unverified accounts can sign in and read what is shared with them but can't upload or share. Signing in with OAuth over an unverified squatted account strips its password and sessions (pre-account-takeover defense).
+- **Password reset by email** that doesn't reveal which addresses have accounts, with single-use links bound to the current password and a sign-out everywhere on success.
+- **Browser sessions without exposing the refresh token**: opt in to an HttpOnly, SameSite=Strict refresh cookie, protected by a signed double-submit CSRF token.
 - **RBAC** (`admin`, `member`, `guest`) mapped to explicit permissions.
 - **Rate-limited login**: Redis sliding-window limits per account and per IP, run atomically in one Lua script.
 - **File sharing on S3/MinIO**: uploads are hashed and size-capped, downloads go through **short-lived presigned URLs**, per-file **viewer/editor grants** (optionally expiring), and anonymous **share links** with an expiry and an optional download cap that holds under concurrency.
@@ -109,6 +111,38 @@ The token is a JWT with its own audience (it can't be used as an access token, n
 
 OAuth sign-ins count as verified, since accounts are only linked on a provider-verified email. That opens one trap: someone registers the victim's address with a password and waits for the victim to sign in with Google, after which both would share the account. So when OAuth links to an account whose email was never verified, the unproven password is removed and its sessions and access tokens are revoked (audited as `auth.unverified_password_removed`).
 
+### Password reset
+
+`POST /auth/password-reset/request {"email": ...}` always answers `202 {"status": "accepted"}`. If the account exists and is active it gets a link to `PASSWORD_RESET_URL` (your frontend), which POSTs the token and the new password to `/auth/password-reset/confirm`. Three things keep the endpoint from becoming an account oracle: the response is identical, the mail is sent as a background task *after* the response so timing is identical too, and the throttle (`PASSWORD_RESET_MAX_PER_EMAIL` per address, `PASSWORD_RESET_MAX_PER_IP` per IP, per hour) is keyed on the address whether or not it exists.
+
+The token is a 30-minute JWT with its own audience, bound to the user, a fingerprint of the address and an HMAC of the **current password hash**. Setting any new password changes that hash, so:
+
+- a link works exactly once, with no table to store used tokens;
+- requesting two links and using one kills the other;
+- a normal password change also kills every outstanding reset link.
+
+Confirming locks the user row, so five concurrent confirms with one token let exactly one through (there is a test). A successful reset revokes every session and live access token, and marks the address verified, since the user just proved they read that inbox. OAuth-only accounts can use it to add a password. Requests (including for unknown addresses) and confirmations are audited.
+
+### Browser sessions (refresh token in a cookie)
+
+Keeping a refresh token in `localStorage` hands it to any XSS. Browser clients can instead send `X-Token-Delivery: cookie` on `/auth/login`:
+
+```mermaid
+sequenceDiagram
+    participant B as Browser (SPA)
+    participant S as API
+    B->>S: POST /auth/login + X-Token-Delivery: cookie
+    S-->>B: {access_token, csrf_token, refresh_token: null}<br/>Set-Cookie safs_refresh (HttpOnly, Secure, SameSite=Strict, Path=/auth)<br/>Set-Cookie safs_csrf (readable)
+    Note over B: access token in memory only
+    B->>S: POST /auth/refresh + X-CSRF-Token (cookie sent by the browser)
+    S->>S: X-CSRF-Token == HMAC(key, refresh cookie)?
+    S-->>B: new access token + rotated cookies and csrf_token
+    B->>S: POST /auth/logout + X-CSRF-Token
+    S-->>B: 204, both cookies cleared, session revoked
+```
+
+`/auth/refresh` and `/auth/logout` take the token from the JSON body if present (API clients, unchanged) and otherwise from the cookie, in which case the `X-CSRF-Token` header must equal an HMAC of that refresh token under the server key. SameSite=Strict already stops cross-site sends; the CSRF token is the second layer. Because it is derived from the refresh token, it rotates with it, needs no storage, and cannot be forged by someone who can only plant cookies (a sibling subdomain, for example), which a plain double-submit cookie would allow. Reuse detection works exactly as for body tokens. CORS is configured with credentials, so `CORS_ORIGINS` must list explicit origins; `*` is refused at startup, as is `COOKIE_SECURE=false` in production.
+
 ### Background cleanup
 
 `python -m app.cleanup` sweeps expired data; Compose runs it as the `cleanup` service (every `CLEANUP_INTERVAL_SECONDS`, default one hour). Use `--once` for cron or a Kubernetes CronJob (it exits non-zero if the sweep fails) and `--dry-run` to only count.
@@ -183,9 +217,11 @@ The test suite runs migrations from scratch, then exercises the API against real
 | POST | `/auth/register` | anyone | password ≥ 12 chars, not containing the email name |
 | POST | `/auth/verify-email` | anyone with the link | `{"token": ...}`; idempotent; `400 invalid_verification_token` if expired, forged or for an old address |
 | POST | `/auth/verify-email/resend` | unverified user | `202`; `409` if already verified; `429` past the hourly cap |
-| POST | `/auth/login` | anyone | rate limited per account and per IP; `429` + `Retry-After` |
-| POST | `/auth/refresh` | refresh token | rotates; replay → `401 refresh_token_reused` |
-| POST | `/auth/logout` | refresh token | revokes that session (token family) |
+| POST | `/auth/login` | anyone | rate limited per account and per IP; `429` + `Retry-After`; `X-Token-Delivery: cookie` for browser sessions |
+| POST | `/auth/password-reset/request` | anyone | `{"email": ...}`; always `202`; `429` past the per-address or per-IP cap |
+| POST | `/auth/password-reset/confirm` | anyone with the link | `{"token", "new_password"}`; `204`, signs out everywhere; `400 invalid_reset_token` if used, expired or stale |
+| POST | `/auth/refresh` | refresh token (body, or cookie + `X-CSRF-Token`) | rotates; replay → `401 refresh_token_reused`; bad CSRF → `403 csrf_failed` |
+| POST | `/auth/logout` | refresh token (body, or cookie + `X-CSRF-Token`) | revokes that session (token family); clears cookies |
 | POST | `/auth/logout-all` | user | revokes all sessions and live access tokens |
 | POST | `/auth/change-password` | user | also logs out everywhere |
 | GET | `/auth/oauth/{github,google}/authorize` | anyone | 302 to provider |
@@ -221,6 +257,8 @@ Errors share one shape: `{"error": {"code": "permission_denied", "message": "...
 - **Audit ids are a Postgres identity, not UUIDs.** `created_at` is the transaction start time, so events inside one transaction tie; a monotonically increasing id gives a total order and a cheap keyset cursor. Retention would be done by a privileged role (or by partitioning by month and dropping old partitions), never by the app's own credentials.
 - **Verification gates writes, not sign-in.** Blocking login until verification makes typos unrecoverable and pushes people to re-register; gating uploads and sharing is what actually stops an unverified address from being used to distribute files. The link targets a frontend page that POSTs the token, so mail scanners that prefetch links can't verify anything by a GET.
 - **Cleanup keeps dead rows for a while.** Expired refresh tokens stay for the retention period, so for a week a replayed old token is still reported as reuse in the audit log instead of looking like garbage, and owners still see recently expired links. Deleting a rotated token never breaks its successor (`replaced_by_id` is `ON DELETE SET NULL`).
+- **Reset tokens are bound to the password, not stored.** A table of used tokens would work, but binding the token to an HMAC of the password hash gives single use, "a newer reset wins" and "a password change revokes pending resets" for free. The HMAC (rather than a plain digest) keeps the readable JWT from carrying anything derived from the stored hash that could be checked offline.
+- **Cookie delivery is opt-in per login.** API and mobile clients keep the simple JSON contract; browsers get the HttpOnly cookie. Mixing is safe because a body token always wins and never needs CSRF (a cross-site page can't read or send it).
 - **Pinned JWT algorithm and audience/issuer checks.** `alg=none` and algorithm substitution are rejected (there are tests for both).
 
 ## Configuration
