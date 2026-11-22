@@ -52,6 +52,35 @@ jobs:
           name: coverage
           path: coverage.xml
 
+  loadtest:
+    # Boots the API and checks with k6 that the download cap and login throttle hold
+    # under concurrent load (the k6 thresholds fail the job on any drift).
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fileshare_load
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/fileshare_load
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --frozen
+      - run: loadtest/run.sh
+
   docker:
     runs-on: ubuntu-latest
     steps:
