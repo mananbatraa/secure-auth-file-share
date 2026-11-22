@@ -51,19 +51,30 @@ Handoff notes between build runs. Slot: Nov 20-21 2026 (runs at 10:40 AM, 4:40 P
 - `UserOut` now has `mfa_enabled`. `AuthService.login` was split into `authenticate` + `complete_login`.
 - README: feature bullet, 2FA section with a sequence diagram, API rows, two design decisions; `.env.example` has the MFA settings.
 
-## Test status
+## Done (Nov 21, final run: polish)
 
-- 334 passed, 0 failed (`uv run pytest`), 99% line+branch coverage (67 new 2FA tests).
+- CI was green for the afternoon run's push.
+- **k6 load test** (`loadtest/k6/security-under-load.js`, `loadtest/run.sh`, `loadtest/README.md`), also a new `loadtest` CI job. Thresholds make k6 fail on drift:
+  - 200 concurrent redemptions of a 25-download share link: exactly 25 redirects, 175 `410`.
+  - 150 concurrent wrong-password logins on one account from 150 addresses: exactly 5 reach the password check, 145 `429` with `Retry-After`.
+  - 40 signed-in users for 30 s: ~310 req/s, refresh p95 ~115 ms, `/users/me` p95 ~60 ms, no errors. The runner also fails if the API logged a `500`.
+  - Checked that a wrong expectation (`LOGIN_MAX_PER_EMAIL=4`) makes k6 exit 99.
+- README: load test section with results, layout block lists `loadtest/` and the newer services, stale test counts fixed (334, 99%).
+
+## Test status (final)
+
+- **ALL TESTS PASSING**: 334 passed, 0 failed (`uv run pytest`), 99% line+branch coverage.
 - `ruff check`, `ruff format --check`, `mypy --strict` (app + tests) all clean.
+- k6 load test passes all thresholds (3 runs locally).
 - Docker image not built in the sandbox (package downloads are blocked there); CI builds it.
 
-## Next steps (ideas for the remaining runs)
+## Slot finished
 
-1. Check CI is green for this run's push.
-2. Final run (Nov 21, 10:40 PM): polish pass and report ALL TESTS PASSING / TESTS FAILING.
-3. A k6 or Locust script for login throttling and share-link redemption under load, with results in the README (dockerd works in the sandbox; k6 via the grafana/k6 image).
-4. OAuth callback could also offer cookie delivery and the 2FA challenge via a frontend redirect (it is a browser redirect, so it should hand off a one-time code instead of returning JSON).
-5. WebAuthn/passkeys as a phishing-resistant second factor.
+This slot ended Nov 21 (Phoenix). Scheduled runs move on to the next project; nothing more is planned here. Ideas if Manan comes back to it:
+
+1. OAuth callback: hand off to a frontend with a one-time code (cookie delivery and the 2FA challenge via redirect instead of JSON).
+2. WebAuthn/passkeys as a phishing-resistant second factor.
+3. A small React frontend or a deployed demo.
 
 ## Local test setup used in the sandbox
 

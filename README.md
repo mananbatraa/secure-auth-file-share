@@ -17,7 +17,8 @@ A FastAPI backend with production-style authentication and file sharing:
 - **Direct-to-S3 uploads** for large files: a presigned POST pinned to the key, exact size, content type and SHA-256, followed by a confirm step that re-verifies the stored object and deletes anything that doesn't match.
 - **Append-only audit log** of every security-relevant event (logins with failure reason, throttling, token reuse, admin changes, grants, share-link use), enforced by a Postgres trigger and queryable by admins.
 - **Background cleanup worker** that removes expired upload intents (and the objects they left in S3), expired refresh tokens, grants and dead share links in small `SKIP LOCKED` batches.
-- Postgres via async SQLAlchemy 2, **Alembic** migrations, Docker Compose stack, CI on GitHub Actions, **227 tests at 98% coverage**, `ruff` + strict `mypy`.
+- Postgres via async SQLAlchemy 2, **Alembic** migrations, Docker Compose stack, CI on GitHub Actions, **334 tests at 99% coverage**, `ruff` + strict `mypy`.
+- **Load-tested security limits**: a k6 run in CI fires 200 concurrent redemptions at a 25-download link and 150 concurrent guesses at one account, and fails unless exactly 25 downloads and exactly 5 password checks get through ([results](#load-test)).
 
 ## Architecture
 
@@ -42,14 +43,16 @@ File bytes never stream back through the API. The API authorizes the request, th
 app/
   core/       config (env vars), security (Argon2id, JWT), RBAC, domain errors
   models/     SQLAlchemy models: User, OAuthAccount, RefreshToken, StoredFile, FilePermission,
-              ShareLink, UploadIntent, AuditEvent
+              ShareLink, UploadIntent, AuditEvent, RecoveryCode
   services/   auth (rotation), oauth, files (permissions, links, direct uploads), storage (S3),
-              rate_limit (Lua), audit, cleanup (expiry sweeps), email_verification, mailer
+              rate_limit (Lua), audit, cleanup (expiry sweeps), email_verification, mailer,
+              password_reset, mfa (TOTP, recovery codes)
   api/        routes + dependencies (current user, permission checks)
   resources.py  process-wide pools/clients, built in the app lifespan
   cleanup.py    `python -m app.cleanup` worker entry point
 alembic/      migrations
 tests/        unit + API tests (real Postgres, fakeredis/real Redis, moto S3 server)
+loadtest/     k6 script + runner: security limits under concurrency, session latency
 ```
 
 ### Refresh-token rotation and reuse detection
@@ -238,11 +241,26 @@ uv run uvicorn app.main:app_factory --factory --reload
 ```bash
 docker compose up -d postgres redis
 createdb -h localhost -U postgres fileshare_test   # once
-uv run pytest --cov=app        # 333 tests
+uv run pytest --cov=app        # 334 tests
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
 The test suite runs migrations from scratch, then exercises the API against real Postgres, a moto S3 server on a local port (so presigned URLs are really fetched over HTTP), and fakeredis. A real Redis is used too when `TEST_REDIS_URL` is reachable. Override `TEST_DATABASE_URL` if your Postgres differs.
+
+### Load test
+
+[`loadtest/`](loadtest/README.md) has a k6 script that checks the security limits hold under concurrency and measures the signed-in path. CI runs it on every push; any drift fails the build. On a 4-vCPU sandbox (API with 2 workers, Postgres, Redis and k6 on the same machine):
+
+| Scenario | Result |
+|---|---|
+| 200 concurrent redemptions of a link capped at 25 | **25** redirects, 175 `410 Gone`, 0 errors |
+| 150 concurrent wrong-password logins on one account, each from a different IP | **5** reached the password check, 145 `429` with `Retry-After` |
+| 40 signed-in users for 30 s (refresh rotation + `GET /users/me`) | ~310 req/s; refresh p50 86 ms / p95 115 ms; `/users/me` p50 44 ms / p95 60 ms |
+
+```bash
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/fileshare_load \
+REDIS_URL=redis://localhost:6379/5 loadtest/run.sh
+```
 
 ## API
 
@@ -291,7 +309,7 @@ Errors share one shape: `{"error": {"code": "permission_denied", "message": "...
 - **`X-Forwarded-For` is ignored by default.** Otherwise an attacker could rotate a spoofed header to get a fresh IP bucket on each try. Set `TRUST_PROXY_HEADERS=true` only behind a proxy you control.
 - **404, not 403, for files you can't see.** This doesn't confirm that a file ID exists. Users who can see a file but lack the level for an action get `403`.
 - **Downloads are always `Content-Disposition: attachment`.** An uploaded HTML or SVG file can't render as a page, so it can't run script. Storage keys are server-generated (`files/{owner}/{uuid}`), and user filenames are only display metadata.
-- **Atomic download caps.** Redeeming a share link is a single conditional `UPDATE … WHERE download_count < max_downloads RETURNING`. Twelve concurrent hits on a 3-download link give exactly three redirects (there is a test for this).
+- **Atomic download caps.** Redeeming a share link is a single conditional `UPDATE … WHERE download_count < max_downloads RETURNING`. Twelve concurrent hits on a 3-download link give exactly three redirects (there is a test for this), and the load test holds a 25-download link to exactly 25 out of 200 concurrent hits.
 - **Argon2id** password hashing. Unknown emails still run a dummy verification, so response time doesn't reveal which accounts exist.
 - **PKCE on OAuth** even for confidential clients, plus single-use `state` stored in Redis (`GETDEL`) and bound to the provider. Accounts are linked by email only when the provider says that email is verified; otherwise an attacker could take over an existing account.
 - **Verify uploads after the fact.** A presigned POST policy is only as good as the storage backend that enforces it (moto, for one, ignores it). The confirm step checks size, content type and checksum against the stored object, so a client can't swap in different bytes, even against a lax backend.
